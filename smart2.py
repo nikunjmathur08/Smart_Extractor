@@ -56,260 +56,95 @@ class WebScraper:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
     
     def clean_product_name(self, name: str) -> str:
-        """Clean product name by extracting meaningful part"""
-        if not name:
-            return "N/A"
-        
-        # Remove extra whitespace and newlines
-        name = ' '.join(name.split())
-        
-        # If there's a closing bracket, extract up to it
+        """Clean product name by extracting text up to the first closing bracket"""
         if ')' in name:
+            # Find the position of the first closing bracket
             bracket_pos = name.find(')')
+            # Extract text up to and including the closing bracket
             cleaned_name = name[:bracket_pos + 1].strip()
-            if len(cleaned_name) > 10:  # Only use if meaningful length
-                return cleaned_name
-        
-        # Limit length to avoid very long names
-        if len(name) > 100:
-            name = name[:100] + "..."
-            
+            return cleaned_name
         return name.strip()
-    
-    def extract_price_from_text(self, text: str) -> int:
-        """Extract numeric price from text"""
-        if not text:
-            return 0
-        
-        # Remove currency symbols and commas
-        price_text = re.sub(r'[₹,\s]', '', text)
-        
-        # Extract numbers
-        numbers = re.findall(r'\d+', price_text)
-        if numbers:
-            # Take the first number found
-            return int(numbers[0])
-        return 0
     
     def scrape_amazon_products(self, search_term: str, min_price: int = 0, max_price: int = 100000, sort_order: str = "asc") -> List[Product]:
         """Scrape Amazon for products within price range"""
         products = []
         
-        # Multiple search strategies
-        search_urls = [
-            f"https://www.amazon.in/s?k={search_term.replace(' ', '+')}&ref=sr_pg_1",
-            f"https://www.amazon.in/s?k={search_term.replace(' ', '%20')}&sort=price-asc-rank" if sort_order == "asc" else f"https://www.amazon.in/s?k={search_term.replace(' ', '%20')}&sort=price-desc-rank"
-        ]
+        # Amazon search URL
+        search_url = f"https://www.amazon.in/s?k={search_term.replace(' ', '+')}&ref=sr_pg_1"
         
-        for search_url in search_urls:
-            try:
-                print(f"   Trying URL: {search_url}")
-                response = self.session.get(search_url, timeout=15)
-                
-                if response.status_code != 200:
-                    print(f"   HTTP {response.status_code}, trying next approach...")
-                    continue
+        try:
+            response = self.session.get(search_url)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Find product containers
+            product_containers = soup.find_all('div', {'data-component-type': 's-search-result'})
+            
+            for container in product_containers:
+                try:
+                    # Extract product name - try multiple selectors
+                    name_elem = container.find('h2', class_='a-size-mini')
+                    if not name_elem:
+                        name_elem = container.find('span', class_='a-size-medium')
+                    if not name_elem:
+                        name_elem = container.find('h2')
+                    if not name_elem:
+                        name_elem = container.find('a', {'class': 'a-link-normal'})
                     
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                # Multiple selectors for different Amazon layouts
-                selectors = [
-                    'div[data-component-type="s-search-result"]',
-                    'div.s-result-item',
-                    'div[data-index]',
-                    'div.sg-col-inner'
-                ]
-                
-                product_containers = []
-                for selector in selectors:
-                    containers = soup.select(selector)
-                    if containers:
-                        product_containers = containers
-                        print(f"   Found {len(containers)} products using selector: {selector}")
-                        break
-                
-                if not product_containers:
-                    print("   No product containers found")
-                    continue
-                
-                for container in product_containers:
-                    try:
-                        product = self.extract_product_info(container, search_term)
-                        if product and min_price <= product.price_numeric <= max_price:
-                            products.append(product)
+                    name = "N/A"
+                    if name_elem:
+                        # Get text from the element or its child elements
+                        name_text = name_elem.get_text().strip()
+                        if name_text:
+                            name = self.clean_product_name(name_text)
+                        elif name_elem.find('span'):
+                            name_text = name_elem.find('span').get_text().strip()
+                            name = self.clean_product_name(name_text)
+                    
+                    # Extract price
+                    price_elem = container.find('span', class_='a-price-whole')
+                    if not price_elem:
+                        price_elem = container.find('span', class_='a-offscreen')
+                    
+                    if price_elem:
+                        price_text = price_elem.get_text().strip()
+                        # Extract numeric price
+                        price_num = int(re.sub(r'[^\d]', '', price_text)) if re.search(r'\d', price_text) else 0
+                        
+                        # Check if price is within range
+                        if min_price <= price_num <= max_price:
+                            # Extract product URL
+                            link_elem = container.find('h2').find('a') if container.find('h2') else None
+                            product_url = urljoin("https://www.amazon.in", link_elem['href']) if link_elem else "N/A"
                             
-                    except Exception as e:
-                        continue
-                
-                # If we found products, break out of URL loop
-                if products:
-                    break
+                            # Extract rating
+                            rating_elem = container.find('span', class_='a-icon-alt')
+                            rating = rating_elem.get_text().split()[0] if rating_elem else "N/A"
+                            
+                            products.append(Product(
+                                name=name,
+                                price=f"₹{price_num:,}",
+                                price_numeric=price_num,  # Store numeric price for sorting
+                                url=product_url,
+                                rating=rating
+                            ))
+                            
+                except Exception as e:
+                    continue
+            
+            # Sort products by price
+            if sort_order == "desc":
+                products.sort(key=lambda x: x.price_numeric, reverse=True)
+            else:
+                products.sort(key=lambda x: x.price_numeric)
                     
-            except Exception as e:
-                print(f"   Error with URL {search_url}: {str(e)}")
-                continue
-        
-        # Remove duplicates based on name similarity
-        products = self.remove_duplicates(products)
-        
-        # Sort products by price
-        if sort_order == "desc":
-            products.sort(key=lambda x: x.price_numeric, reverse=True)
-        else:
-            products.sort(key=lambda x: x.price_numeric)
+        except Exception as e:
+            print(f"Error scraping Amazon: {str(e)}")
         
         return products
-    
-    def extract_product_info(self, container, search_term: str) -> Optional[Product]:
-        """Extract product information from a container element"""
-        try:
-            # Extract product name with multiple strategies
-            name = self.extract_product_name(container)
-            if not name or name == "N/A":
-                return None
-            
-            # Extract price with multiple strategies
-            price_numeric = self.extract_product_price(container)
-            if price_numeric == 0:
-                return None
-            
-            # Extract URL
-            url = self.extract_product_url(container)
-            
-            # Extract rating
-            rating = self.extract_product_rating(container)
-            
-            return Product(
-                name=name,
-                price=f"₹{price_numeric:,}",
-                price_numeric=price_numeric,
-                url=url,
-                rating=rating
-            )
-            
-        except Exception as e:
-            return None
-    
-    def extract_product_name(self, container) -> str:
-        """Extract product name using multiple strategies"""
-        # Strategy 1: Common product title selectors
-        name_selectors = [
-            'a-size-medium',
-        ]
-        
-        for selector in name_selectors:
-            elements = container.select(selector)
-            for element in elements:
-                text = element.get_text().strip()
-                if text and len(text) > 5:  # Meaningful name length
-                    return self.clean_product_name(text)
-        
-        # Strategy 2: Look for any meaningful text in links
-        links = container.find_all('a', href=True)
-        for link in links:
-            if '/dp/' in link.get('href', ''):
-                text = link.get_text().strip()
-                if text and len(text) > 10:
-                    return self.clean_product_name(text)
-        
-        return "N/A"
-    
-    def extract_product_price(self, container) -> int:
-        """Extract product price using multiple strategies"""
-        # Strategy 1: Common price selectors
-        price_selectors = [
-            '.a-price-whole',
-            '.a-price .a-offscreen',
-            '.a-price-range .a-offscreen',
-            '.a-price-symbol + .a-price-whole',
-            'span.a-price-whole',
-            '.s-price-range-separator',
-            '.a-price'
-        ]
-        
-        for selector in price_selectors:
-            elements = container.select(selector)
-            for element in elements:
-                price_text = element.get_text().strip()
-                price_num = self.extract_price_from_text(price_text)
-                if price_num > 0:
-                    return price_num
-        
-        # Strategy 2: Look for any text containing price patterns
-        all_text = container.get_text()
-        price_patterns = [
-            r'₹\s*(\d{1,3}(?:,\d{3})*)',
-            r'Rs\.?\s*(\d{1,3}(?:,\d{3})*)',
-            r'INR\s*(\d{1,3}(?:,\d{3})*)'
-        ]
-        
-        for pattern in price_patterns:
-            matches = re.findall(pattern, all_text)
-            for match in matches:
-                price_num = int(match.replace(',', ''))
-                if 100 <= price_num <= 1000000:  # Reasonable price range
-                    return price_num
-        
-        return 0
-    
-    def extract_product_url(self, container) -> str:
-        """Extract product URL"""
-        # Look for product detail page links
-        links = container.find_all('a', href=True)
-        for link in links:
-            href = link.get('href', '')
-            if '/dp/' in href or '/gp/product/' in href:
-                return urljoin("https://www.amazon.in", href)
-        return "N/A"
-    
-    def extract_product_rating(self, container) -> str:
-        """Extract product rating"""
-        # Common rating selectors
-        rating_selectors = [
-            '.a-icon-alt',
-            '.a-star-mini .a-icon-alt',
-            'span[aria-label*="out of"]'
-        ]
-        
-        for selector in rating_selectors:
-            elements = container.select(selector)
-            for element in elements:
-                text = element.get('aria-label', '') or element.get_text()
-                if 'out of' in text or 'stars' in text:
-                    # Extract rating number
-                    rating_match = re.search(r'(\d+\.?\d*)', text)
-                    if rating_match:
-                        return f"{rating_match.group(1)}/5"
-        
-        return "N/A"
-    
-    def remove_duplicates(self, products: List[Product]) -> List[Product]:
-        """Remove duplicate products based on name similarity"""
-        if not products:
-            return products
-        
-        unique_products = []
-        seen_names = set()
-        
-        for product in products:
-            # Create a normalized name for comparison
-            normalized_name = re.sub(r'[^\w\s]', '', product.name.lower())
-            normalized_name = ' '.join(normalized_name.split()[:5])  # First 5 words
-            
-            if normalized_name not in seen_names:
-                seen_names.add(normalized_name)
-                unique_products.append(product)
-        
-        return unique_products
 
 class SmartExtractor:
     def __init__(self, model_name: str = "llama3:8b-instruct-q8_0"):
@@ -437,11 +272,11 @@ class SmartExtractor:
     
     def extract_data(self, query: str) -> List[Product]:
         """Main extraction method"""
-        print("Parsing your query...")
+        print("🔍 Parsing your query...")
         parsed = self.parse_query(query)
-        print(f"Understood: {parsed}")
+        print(f" Understood: {parsed}")
         
-        print(f"Searching {parsed['platform']} for {parsed['product_type']}...")
+        print(f" Searching {parsed['platform']} for {parsed['product_type']}...")
         
         if parsed["platform"] == "amazon":
             products = self.scraper.scrape_amazon_products(
@@ -451,40 +286,51 @@ class SmartExtractor:
                 parsed.get("sort_order", "asc")
             )
         else:
-            print(f"Platform {parsed['platform']} not yet supported")
+            print(f" Platform {parsed['platform']} not yet supported")
             return []
         
-        print(f"Found {len(products)} products matching criteria")
         return products
     
     def summarize_results(self, products: List[Product], original_query: str) -> str:
-        """Generate intelligent summary of results - SIMPLIFIED VERSION"""
+        """Generate intelligent summary of results"""
         if not products:
             return "No products found matching your criteria."
         
-        # Create a simple summary without complex LLM processing
-        avg_price = sum(p.price_numeric for p in products) / len(products)
-        min_price = min(p.price_numeric for p in products)
-        max_price = max(p.price_numeric for p in products)
+        # Prepare product data for analysis
+        product_data = []
+        for i, p in enumerate(products[:10], 1):
+            product_data.append({
+                "rank": i,
+                "name": p.name,
+                "price": p.price_numeric,
+                "rating": p.rating
+            })
         
-        # Count products with ratings
-        rated_products = [p for p in products if p.rating != "N/A"]
+        avg_price = sum(p["price"] for p in product_data) / len(product_data) if product_data else 0
+        price_range = f"₹{min(p['price'] for p in product_data):,} - ₹{max(p['price'] for p in product_data):,}"
         
-        summary = f"""SEARCH RESULTS SUMMARY:
-                
-        • Found {len(products)} products matching your criteria
-        • Price Range: ₹{min_price:,} - ₹{max_price:,}
-        • Average Price: ₹{avg_price:,.0f}
-        • Products with ratings: {len(rated_products)}/{len(products)}
+        # Create a simpler, more direct prompt
+        analysis_prompt = f"""Analyze these smartphone search results and provide shopping recommendations:
 
-        TOP RECOMMENDATIONS:"""
+        QUERY: {original_query}
+        RESULTS: Found {len(products)} products
+        PRICE RANGE: {price_range}
+        AVERAGE PRICE: ₹{avg_price:,.0f}
+
+        TOP PRODUCTS:
+        {chr(10).join([f"{p['rank']}. {p['name']} - ₹{p['price']:,} (Rating: {p['rating']})" for p in product_data])}
+
+        Provide a concise analysis with:
+        1. Market overview (2-3 sentences)
+        2. Top 2-3 product recommendations with reasons
+        3. Best value pick
+        4. Buying advice
+
+        Keep response under 250 words and focus on practical insights."""
         
-        # Add top 3 products
-        for i, product in enumerate(products[:3], 1):
-            summary += f"\n{i}. {product.name[:50]}{'...' if len(product.name) > 50 else ''}"
-            summary += f"\n   {product.price} | {product.rating}\n"
+        system_prompt = "You are a helpful shopping advisor. Analyze the search results and provide clear, actionable recommendations to help users make informed purchasing decisions."
         
-        return summary
+        return self.llm.generate(analysis_prompt, system_prompt)
 
 def main():
     parser = argparse.ArgumentParser(description="Smart Web Extractor")
@@ -492,7 +338,7 @@ def main():
     parser.add_argument("--query", help="Direct query to process")
     args = parser.parse_args()
     
-    print("Smart Web Extractor v2.0 - FIXED VERSION")
+    print("Smart Web Extractor v1.0")
     print("=" * 50)
     
     extractor = SmartExtractor(args.model)
@@ -531,12 +377,12 @@ def main():
     else:
         # Interactive mode
         print("\nInteractive Mode - Type your queries below:")
-        print("Example: 'Give me all phones under 99k on amazon'")
+        print("Example: 'Give me all phones between 20k to 30k on amazon'")
         print("Type 'quit' to exit\n")
         
         while True:
             try:
-                query = input("Your query: ").strip()
+                query = input("🔍 Your query: ").strip()
                 
                 if query.lower() in ['quit', 'exit', 'q']:
                     print("Goodbye!")
