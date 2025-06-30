@@ -1,0 +1,2 @@
+fruits = ["Apple", "Mango", 'Grapes', 'Oranges', 'Banana'] 
+print(fruits[2],fruits[-2])
