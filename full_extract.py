@@ -124,9 +124,27 @@ def build_source_url(site_key: str, query: str) -> str:
     print(f"Generated URL: {builder(query)}")
     return builder(query)
 
+def generate_paginated_urls(base_url: str, site_key: str, pages: int = 5) -> List[str]:
+    urls = [base_url]
+
+    for i in range(2, pages + 1):
+        if site_key == "amazon":
+            urls.append(f"{base_url}&page={i}")
+        elif site_key == "flipkart":
+            urls.append(f"{base_url}&page={i}")
+        elif site_key == "croma":
+            urls.append(f"{base_url}&page={i}")
+        elif site_key == "duckduckgo":
+            urls.append(f"{base_url}&start={(i - 1) * 30}")
+        else:
+            break
+    
+    return urls
+
 async def run_crawl4ai_scraper(structured):
     site_key = structured.get("site", DEFAULT_SITE).lower()
     source_url = build_source_url(site_key, structured['query'])
+    paginated_urls = generate_paginated_urls(source_url, site_key, pages=5)
     
     browser_conf = BrowserConfig(
         headless=False,
@@ -141,26 +159,34 @@ async def run_crawl4ai_scraper(structured):
         override_navigator=True,
         scan_full_page=True,
         delay_before_return_html=7,
-
         js_code=[
             "window.scrollTo(0, document.body.scrollHeight/2);",
             "await new Promise(resolve => setTimeout(resolve, 3000));"
         ]
     )
 
+    all_products = []
+
     try:
         async with AsyncWebCrawler(config=browser_conf) as crawler:
-            result = await crawler.arun(url=source_url, config=run_conf)
+            for i, url in enumerate(paginated_urls, start=1):
+                print(f"Scraping page {i}: {url}")
+                result = await crawler.arun(url=url, config=run_conf)
             
-        if not result.success:
-            print(f"❌ Crawling failed: {result.error_message}")
-            return []
+                if not result.success:
+                    print(f"Failed to scrape page {i}: {result.error_message}")
+                    continue
 
-        return parse_products_from_markdown(
-            result.markdown, 
-            structured.get("min_price", 0),
-            structured.get("max_price", 999999)
-        )
+                page_products = parse_products_from_markdown(
+                    result.markdown,
+                    structured.get("min_price", 0),
+                    structured.get("max_price", 999999)
+                )
+
+                all_products.extend(page_products)
+
+                await asyncio.sleep(2)
+        return all_products
     except Exception as e:
         print(f"⚠️ Scraping error: {str(e)}")
         return []
@@ -254,3 +280,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# implement direct url scraping
+# use dataframes to store results, consolidate results based on websites
+# fmcgs - instamart, blinkit
+# allow to customize the number of pages scraped
