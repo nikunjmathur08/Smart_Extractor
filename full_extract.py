@@ -6,6 +6,7 @@ import urllib.parse
 from crawl4ai import *
 from typing import List
 import urllib.parse
+import pandas as pd
 
 SITE_URL_BUILDERS = {
     "amazon": lambda query: f"https://www.amazon.in/s?k={urllib.parse.quote_plus(query)}",
@@ -190,6 +191,60 @@ async def run_crawl4ai_scraper(structured):
     except Exception as e:
         print(f"⚠️ Scraping error: {str(e)}")
         return []
+    
+async def url_scraper(url, min_price=0, max_price=999999):
+    config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        wait_for_images=True,
+        magic=True,
+        simulate_user=True,
+        override_navigator=True,
+        scan_full_page=True,
+        delay_before_return_html=7,
+        js_code=[
+            "window.scrollTo(0, document.body.scrollHeight/2);",
+            "await new Promise(resolve => setTimeout(resolve, 3000));"
+        ]
+    )
+    browser_conf = BrowserConfig(
+        headless=False,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    )
+
+    try:
+        async with AsyncWebCrawler(config=browser_conf) as crawler:
+            result = await crawler.arun(url, config=config)  
+
+            if not result.success:
+                print(f"Failed to scrape: {result.error_message}")
+                return []
+            
+            products = parse_products_from_markdown(
+                result.markdown,
+                min_price=min_price,
+                max_price=max_price
+            )
+
+            if products:
+                print(f"Found {len(products)} product(s):\n")
+                display_results(products)
+            else:
+                print("No product-style data found.")
+                print("Here's the markdown of the scraped content:\n")
+                cleaned_text = clean_markdown_to_text(result.markdown)
+                print(cleaned_text)
+
+        return products
+    except Exception as e:
+        print(f"Scraping error: {str(e)}")
+        return []
+
+def clean_markdown_to_text(markdown: str) -> str:
+    markdown = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', markdown)  # keep link text only
+    markdown = re.sub(r'\*\*(.*?)\*\*', r'\1', markdown)  # bold
+    markdown = re.sub(r'#+ ', '', markdown)  # headings
+    markdown = re.sub(r'\s{2,}', ' ', markdown)  # excess whitespace
+    return markdown.strip()
 
 def parse_products_from_markdown(markdown, min_price, max_price):
     """Robust product parsing with improved pattern matching"""
@@ -234,49 +289,71 @@ def sanitize_query(text: str) -> str:
     text = re.sub(r'₹|rs\.?|inr', '', text, flags=re.I)
     return re.sub(r'\s+', ' ', text).strip()
 
+def display_results(products: List[dict]):
+    for i, item in enumerate(products, 1):
+        title = item.get("title", "")
+        price = f"₹{item['price']:,}" if item.get("price") else "N/A"
+        link = item.get("link", "")
+        image = item.get("image", "")
+
+        parts = title.split(" | ", 1)
+        main_title = parts[0].strip()
+        description = parts[1].strip() if len(parts) > 1 else ""
+
+        print(f"\n{i}.🛒 {main_title}")
+        print(f"   💰 Price: {price}")
+        if link:
+            print(f"   🔗 Link: {link}")
+        if image:
+            print(f"   🖼️ Image: {image}")
+        if description:
+            print(f"   📦 Details: {description}")
+        print("-" * 80)
+
 def main():
     print("🛒 Smart Product Scraper")
     
     while True:
-        user_input = input("\n🔍 What would you like to scrape? (or type 'exit')\n→ ")
+        print("\n🔍 What would you like to scrape? (or type 'exit')\n")
+        user_input = input("\n Enter 1 for simple URL scraping\n Enter 2 for prompt scraping\n→ ")
         if user_input.lower() == 'exit':
             print("Bye bye! ^_^")
             break
-            
-        structured = query_llama(user_input)
-        if not structured:
-            print("❌ Could not parse your query. Please try again.")
-            continue
-        
-        questions = ask_follow_up_questions(user_input, structured)
-        if questions:
-            print("\n I have a few questions to refine your search...")
-            user_answers = []
-            for q in questions:
-                ans = input(f"→ {q} ")
-                user_answers.append(ans.strip())
-            
-            structured = refine_structured_query_with_answers(user_input, user_answers, structured)
-        
-        structured["query"] = sanitize_query(structured["query"])
 
-        print("\n📋 Final Structured Query:")
-        print(json.dumps(structured, indent=2))
-        
-        results = asyncio.run(run_crawl4ai_scraper(structured))
-        if not results:
-            print("\n⚠️ No products matched your filters.")
-            continue
+        elif user_input == '1':
+            query = input("Please enter the URL you want to scrape\n→ ")
+            asyncio.run(url_scraper(query))
             
-        print(f"\n🛍️ Found {len(results)} product(s):\n")
-        for i, item in enumerate(results, 1):
-            print(f"{i}. {item['title']}")
-            print(f"   💰 ₹{item['price']:,}")
-            if item['link']:
-                print(f"   🔗 {item['link']}")
-            if item.get('image'):
-                print(f"   🖼️ {item['image']}")
-            print("-" * 80)
+        elif user_input == '2':
+            user_input = input("\n🗣️ Enter your product prompt:\n→ ").strip()
+
+            structured = query_llama(user_input)
+            if not structured:
+                print("❌ Could not parse your query. Please try again.")
+                continue
+
+            questions = ask_follow_up_questions(user_input, structured)
+            if questions:
+                print("\n🤖 I have a few questions to refine your search...")
+                user_answers = []
+                for q in questions:
+                    ans = input(f"→ {q} ")
+                    user_answers.append(ans.strip())
+                structured = refine_structured_query_with_answers(user_input, user_answers, structured)
+
+            structured["query"] = sanitize_query(structured["query"])
+
+            print("\n📋 Final Structured Query:")
+            print(json.dumps(structured, indent=2))
+
+            results = asyncio.run(run_crawl4ai_scraper(structured))
+            if not results:
+                print("\n⚠️ No products matched your filters.")
+                continue
+
+            display_results(results)
+        else:
+            print("❌ Invalid option. Please choose 1 or 2.")
 
 if __name__ == "__main__":
     main()
