@@ -397,6 +397,21 @@ def save_to_dataframe(products: List[Dict], filename: str = "scraped_products.cs
     except Exception as e:
         print(f"❌ Error saving to CSV: {str(e)}")
 
+def save_to_excel(products: List[Dict], filename: str = "scraped_products.xlsx") -> None:
+    """Save products to an Excel file using Pandas"""
+    if not products:
+        print("📭 No products to save")
+        return
+    if ".xlsx" not in filename:
+        filename = filename + ".xlsx"
+    
+    try:
+        df = pd.DataFrame(products)
+        df.to_excel(filename, index=False)
+        print(f"💾 Results saved to {filename}")
+    except Exception as e:
+        print(f"❌ Error saving to CSV: {str(e)}")
+
 def main():
     """Main function with improved error handling"""
     print("🛒 Smart Product Scraper")
@@ -466,13 +481,15 @@ def main():
 
             display_results(results)
             
-            save_option = input("\n💾 Save results to CSV? (y/n): ").strip().lower()
-            if save_option == 'y':
+            save_option = input("\n💾 Save results? (csv/xlsx/none): ").strip().lower()
+            if save_option == 'csv':
                 filename = input("\n What would you like to name the file?").strip().lower()
                 save_to_dataframe(results, filename)
-                
+            elif save_option == 'xlsx':
+                filename = input("\n What would you like to name the file?").strip().lower()
+                save_to_excel(results, filename)
         else:
-            print("❌ Invalid option. Please choose 1 or 2.")
+            print("❌ Invalid option. Please choose csv/xlsx/none.")
 
 if __name__ == "__main__":
     main()
