@@ -4,7 +4,7 @@ import json
 import subprocess
 import urllib.parse
 from crawl4ai import *
-from typing import List
+from typing import List, Dict, Optional
 import urllib.parse
 import pandas as pd
 
@@ -24,8 +24,18 @@ def extract_search_terms(structured_query):
     additional_filters = structured_query.get('additional_filters', [])
     
     search_terms = [product_type] if product_type else []
-    search_terms.extend(filter_term for filter_term in additional_filters 
-                       if filter_term not in ['premium', 'budget', 'cheap', 'expensive'])
+    
+    # Handle additional_filters properly - check if it's a list of dicts or strings
+    if isinstance(additional_filters, list):
+        for filter_item in additional_filters:
+            if isinstance(filter_item, dict):
+                # Extract values from dict format
+                values = filter_item.get('values', [])
+                if isinstance(values, list):
+                    search_terms.extend(v for v in values if v not in ['premium', 'budget', 'cheap', 'expensive'])
+            elif isinstance(filter_item, str):
+                if filter_item not in ['premium', 'budget', 'cheap', 'expensive']:
+                    search_terms.append(filter_item)
     
     if not search_terms:
         original = structured_query.get('query', '')
@@ -36,9 +46,32 @@ def extract_search_terms(structured_query):
     
     return ' '.join(search_terms).strip()
 
-def query_llama(user_input):
-    """Uses Ollama to extract structured info with robust JSON parsing"""
+def create_fallback_query(user_input: str) -> Dict:
+    """Create a fallback structured query when LLM fails"""
+    # Basic extraction of product type and price from user input
+    price_match = re.search(r'(?:under|below|max|maximum)\s*(?:₹|rs\.?|inr)?\s*(\d+(?:,\d+)*)', user_input, re.IGNORECASE)
+    max_price = int(price_match.group(1).replace(',', '')) if price_match else 999999
     
+    # Extract site preference
+    site_match = re.search(r'\b(amazon|flipkart|croma|tatacliq)\b', user_input, re.IGNORECASE)
+    site = site_match.group(1).lower() if site_match else DEFAULT_SITE
+    
+    # Clean the query
+    cleaned_query = sanitize_query(user_input)
+    
+    return {
+        "site": site,
+        "product_type": "electronics",  # default category
+        "min_price": 0,
+        "max_price": max_price,
+        "sort_order": None,
+        "additional_filters": [],
+        "goal": f"search for {cleaned_query}",
+        "query": cleaned_query
+    }
+
+def query_llama(user_input: str) -> Optional[Dict]:
+    """Uses Ollama to extract structured info with robust JSON parsing"""
     try:
         process = subprocess.run(
             ["ollama", "run", "query-llama"],
@@ -52,21 +85,28 @@ def query_llama(user_input):
         # Robust JSON extraction
         json_match = re.search(r'\{[\s\S]*\}', stdout)
         if not json_match:
-            raise ValueError("No JSON found in LLM output")
+            print("⚠️ LLM didn't return valid JSON, creating fallback query...")
+            return create_fallback_query(user_input)
             
         result = json.loads(json_match.group(0))
 
         if result.get('max_price') is None:
-            result['max_price'] = 99999
+            result['max_price'] = 999999
         
+        # Ensure query field exists
+        if 'query' not in result:
+            result['query'] = sanitize_query(user_input)
+            
         return result
     except (json.JSONDecodeError, ValueError, subprocess.TimeoutExpired) as e:
-        print(f"LLM processing error: {str(e)}")
-        return None
+        print(f"⚠️ LLM processing error: {str(e)}, creating fallback query...")
+        return create_fallback_query(user_input)
+    except FileNotFoundError:
+        print("⚠️ Ollama not found, creating fallback query...")
+        return create_fallback_query(user_input)
 
-def ask_follow_up_questions(user_input, structured_query):
+def ask_follow_up_questions(user_input: str, structured_query: Dict) -> List[str]:
     """Ask follow-up questions based on the input using LLM"""
-
     prompt = f"""
     **User Input**: {user_input}
     **Structured Query**: {json.dumps(structured_query, indent=2)}
@@ -83,10 +123,10 @@ def ask_follow_up_questions(user_input, structured_query):
         json_match = re.search(r'\[[\s\S]*\]', stdout)
         return json.loads(json_match.group(0)) if json_match else []
     except Exception as e:
-        print(f"Could not generate questions: {str(e)}")
+        print(f"⚠️ Could not generate questions: {str(e)}")
         return []
     
-def refine_structured_query_with_answers(original_input, answers, previous_query):
+def refine_structured_query_with_answers(original_input: str, answers: List[str], previous_query: Dict) -> Dict:
     """Regenerate final structured query after follow-up answers."""
     prompt = f"""
         **Original Input**: {original_input}
@@ -113,17 +153,22 @@ def refine_structured_query_with_answers(original_input, answers, previous_query
         result = json.loads(json_match.group(0)) if json_match else previous_query
 
         if result.get('max_price') is None:
-            result['max_price'] = 99999
+            result['max_price'] = 999999
+
+        # Ensure query field exists
+        if 'query' not in result:
+            result['query'] = sanitize_query(original_input)
 
         return result
     except Exception as e:
-        print(f"Failed to refine structured query: {e}")
+        print(f"⚠️ Failed to refine structured query: {e}")
         return previous_query
 
 def build_source_url(site_key: str, query: str) -> str:
     builder = SITE_URL_BUILDERS.get(site_key.lower(), SITE_URL_BUILDERS[DEFAULT_SITE])
-    print(f"Generated URL: {builder(query)}")
-    return builder(query)
+    url = builder(query)
+    print(f"Generated URL: {url}")
+    return url
 
 def generate_paginated_urls(base_url: str, site_key: str, pages: int = 5) -> List[str]:
     urls = [base_url]
@@ -142,10 +187,25 @@ def generate_paginated_urls(base_url: str, site_key: str, pages: int = 5) -> Lis
     
     return urls
 
-async def run_crawl4ai_scraper(structured):
-    site_key = structured.get("site", DEFAULT_SITE).lower()
-    source_url = build_source_url(site_key, structured['query'])
-    paginated_urls = generate_paginated_urls(source_url, site_key, pages=5)
+async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
+    """Main scraping function with proper error handling"""
+    if not structured:
+        print("❌ No structured query provided")
+        return []
+    
+    site_key = structured.get("site", DEFAULT_SITE)
+    if site_key is None:
+        site_key = DEFAULT_SITE
+    
+    site_key = site_key.lower()
+    
+    query = structured.get('query', '')
+    if not query:
+        print("❌ No query found in structured data")
+        return []
+    
+    source_url = build_source_url(site_key, query)
+    paginated_urls = generate_paginated_urls(source_url, site_key, pages=3)  # Reduced pages for testing
     
     browser_conf = BrowserConfig(
         headless=False,
@@ -171,11 +231,11 @@ async def run_crawl4ai_scraper(structured):
     try:
         async with AsyncWebCrawler(config=browser_conf) as crawler:
             for i, url in enumerate(paginated_urls, start=1):
-                print(f"Scraping page {i}: {url}")
+                print(f"🔍 Scraping page {i}: {url}")
                 result = await crawler.arun(url=url, config=run_conf)
             
                 if not result.success:
-                    print(f"Failed to scrape page {i}: {result.error_message}")
+                    print(f"❌ Failed to scrape page {i}: {result.error_message}")
                     continue
 
                 page_products = parse_products_from_markdown(
@@ -185,14 +245,18 @@ async def run_crawl4ai_scraper(structured):
                 )
 
                 all_products.extend(page_products)
+                print(f"✅ Found {len(page_products)} products on page {i}")
 
                 await asyncio.sleep(2)
+                
+        print(f"🎉 Total products found: {len(all_products)}")
         return all_products
     except Exception as e:
         print(f"⚠️ Scraping error: {str(e)}")
         return []
     
-async def url_scraper(url, min_price=0, max_price=999999):
+async def url_scraper(url: str, min_price: int = 0, max_price: int = 999999) -> List[Dict]:
+    """Scrape a single URL"""
     config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
         wait_for_images=True,
@@ -216,7 +280,7 @@ async def url_scraper(url, min_price=0, max_price=999999):
             result = await crawler.arun(url, config=config)  
 
             if not result.success:
-                print(f"Failed to scrape: {result.error_message}")
+                print(f"❌ Failed to scrape: {result.error_message}")
                 return []
             
             products = parse_products_from_markdown(
@@ -226,27 +290,28 @@ async def url_scraper(url, min_price=0, max_price=999999):
             )
 
             if products:
-                print(f"Found {len(products)} product(s):\n")
+                print(f"✅ Found {len(products)} product(s):\n")
                 display_results(products)
             else:
-                print("No product-style data found.")
-                print("Here's the markdown of the scraped content:\n")
+                print("⚠️ No product-style data found.")
+                print("📄 Here's the markdown of the scraped content:\n")
                 cleaned_text = clean_markdown_to_text(result.markdown)
-                print(cleaned_text)
+                print(cleaned_text[:2000] + "..." if len(cleaned_text) > 2000 else cleaned_text)
 
         return products
     except Exception as e:
-        print(f"Scraping error: {str(e)}")
+        print(f"❌ Scraping error: {str(e)}")
         return []
 
 def clean_markdown_to_text(markdown: str) -> str:
+    """Clean markdown and convert to readable text"""
     markdown = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', markdown)  # keep link text only
     markdown = re.sub(r'\*\*(.*?)\*\*', r'\1', markdown)  # bold
     markdown = re.sub(r'#+ ', '', markdown)  # headings
     markdown = re.sub(r'\s{2,}', ' ', markdown)  # excess whitespace
     return markdown.strip()
 
-def parse_products_from_markdown(markdown, min_price, max_price):
+def parse_products_from_markdown(markdown: str, min_price: int, max_price: int) -> List[Dict]:
     """Robust product parsing with improved pattern matching"""
     products = []
     
@@ -284,15 +349,24 @@ def parse_products_from_markdown(markdown, min_price, max_price):
     return products
 
 def sanitize_query(text: str) -> str:
+    """Clean and sanitize search query"""
     text = re.sub(r'(under|above|over|below)\s+₹?\s*[\d,]+', '', text, flags=re.I)
     text = re.sub(r'\b(at|on|from)\s+(amazon|flipkart|croma|tatacliq)\b', '', text, flags=re.I)
     text = re.sub(r'₹|rs\.?|inr', '', text, flags=re.I)
     return re.sub(r'\s+', ' ', text).strip()
 
-def display_results(products: List[dict]):
+def display_results(products: List[Dict]) -> None:
+    """Display scraped products in a formatted way"""
+    if not products:
+        print("📭 No products to display")
+        return
+        
+    print(f"\n🛍️ Found {len(products)} products:")
+    print("=" * 80)
+    
     for i, item in enumerate(products, 1):
-        title = item.get("title", "")
-        price = f"₹{item['price']:,}" if item.get("price") else "N/A"
+        title = item.get("title", "No title")
+        price = f"₹{item['price']:,}" if item.get("price") else "Price not available"
         link = item.get("link", "")
         image = item.get("image", "")
 
@@ -300,7 +374,7 @@ def display_results(products: List[dict]):
         main_title = parts[0].strip()
         description = parts[1].strip() if len(parts) > 1 else ""
 
-        print(f"\n{i}.🛒 {main_title}")
+        print(f"\n{i}. 🛒 {main_title}")
         print(f"   💰 Price: {price}")
         if link:
             print(f"   🔗 Link: {link}")
@@ -310,55 +384,95 @@ def display_results(products: List[dict]):
             print(f"   📦 Details: {description}")
         print("-" * 80)
 
+def save_to_dataframe(products: List[Dict], filename: str = "scraped_products.csv") -> None:
+    """Save products to a CSV file using pandas"""
+    if not products:
+        print("📭 No products to save")
+        return
+        
+    try:
+        df = pd.DataFrame(products)
+        df.to_csv(filename, index=False)
+        print(f"💾 Results saved to {filename}")
+    except Exception as e:
+        print(f"❌ Error saving to CSV: {str(e)}")
+
 def main():
+    """Main function with improved error handling"""
     print("🛒 Smart Product Scraper")
+    print("=" * 50)
     
     while True:
-        print("\n🔍 What would you like to scrape? (or type 'exit')\n")
-        user_input = input("\n Enter 1 for simple URL scraping\n Enter 2 for prompt scraping\n→ ")
+        print("\n🔍 What would you like to scrape? (or type 'exit')")
+        print("1. Simple URL scraping")
+        print("2. Intelligent prompt-based scraping")
+        
+        user_input = input("\n→ Choose option (1/2) or 'exit': ").strip()
+        
         if user_input.lower() == 'exit':
-            print("Bye bye! ^_^")
+            print("👋 Goodbye!")
             break
 
         elif user_input == '1':
-            query = input("Please enter the URL you want to scrape\n→ ")
-            asyncio.run(url_scraper(query))
+            url = input("\n🌐 Enter the URL to scrape: ").strip()
+            if not url:
+                print("❌ No URL provided")
+                continue
+                
+            print(f"🔍 Scraping: {url}")
+            products = asyncio.run(url_scraper(url))
+            
+            if products:
+                save_option = input("\n💾 Save results to CSV? (y/n): ").strip().lower()
+                if save_option == 'y':
+                    save_to_dataframe(products)
             
         elif user_input == '2':
-            user_input = input("\n🗣️ Enter your product prompt:\n→ ").strip()
+            user_prompt = input("\n🗣️ Enter your product search prompt: ").strip()
+            if not user_prompt:
+                print("❌ No prompt provided")
+                continue
 
-            structured = query_llama(user_input)
+            print("🤖 Processing your request...")
+            structured = query_llama(user_prompt)
+            
             if not structured:
                 print("❌ Could not parse your query. Please try again.")
                 continue
 
-            questions = ask_follow_up_questions(user_input, structured)
+            print("✅ Query parsed successfully!")
+            
+            questions = ask_follow_up_questions(user_prompt, structured)
             if questions:
-                print("\n🤖 I have a few questions to refine your search...")
+                print("\n🤖 I have a few questions to refine your search:")
                 user_answers = []
                 for q in questions:
-                    ans = input(f"→ {q} ")
-                    user_answers.append(ans.strip())
-                structured = refine_structured_query_with_answers(user_input, user_answers, structured)
+                    ans = input(f"→ {q} ").strip()
+                    user_answers.append(ans)
+                structured = refine_structured_query_with_answers(user_prompt, user_answers, structured)
+                print("✅ Query refined with your answers!")
 
-            structured["query"] = sanitize_query(structured["query"])
+            structured["query"] = sanitize_query(structured.get("query", user_prompt))
 
-            print("\n📋 Final Structured Query:")
+            print("\n📋 Final Search Configuration:")
             print(json.dumps(structured, indent=2))
 
+            print("\n🚀 Starting scraping process...")
             results = asyncio.run(run_crawl4ai_scraper(structured))
+            
             if not results:
-                print("\n⚠️ No products matched your filters.")
+                print("\n⚠️ No products found matching your criteria.")
                 continue
 
             display_results(results)
+            
+            save_option = input("\n💾 Save results to CSV? (y/n): ").strip().lower()
+            if save_option == 'y':
+                filename = input("\n What would you like to name the file?").strip().lower()
+                save_to_dataframe(results, filename)
+                
         else:
             print("❌ Invalid option. Please choose 1 or 2.")
 
 if __name__ == "__main__":
     main()
-
-# implement direct url scraping
-# use dataframes to store results, consolidate results based on websites
-# fmcgs - instamart, blinkit
-# allow to customize the number of pages scraped
