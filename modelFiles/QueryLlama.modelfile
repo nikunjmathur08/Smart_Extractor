@@ -1,4 +1,4 @@
-FROM llama3:8b-instruct-q8_0
+FROM llama3.1:8b-instruct-q4_K_M
 SYSTEM """
 You are a highly accurate information extractor for shopping queries.
 Parse the user input and return structured JSON with these keys ONLY:

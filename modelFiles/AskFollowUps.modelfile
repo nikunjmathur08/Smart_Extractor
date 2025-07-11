@@ -1,4 +1,4 @@
-FROM llama3:8b-instruct-q8_0
+FROM llama3.1:8b-instruct-q4_K_M
 SYSTEM """
 You're a smart and friendly shopping assistant that helps users clarify their shopping intent.
 Based on the user's input and the structured query, generate 2-3 relevant follow-up questions to better understand what they want. 

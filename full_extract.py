@@ -7,6 +7,7 @@ from crawl4ai import *
 from typing import List, Dict, Optional
 import urllib.parse
 import pandas as pd
+import requests
 
 SITE_URL_BUILDERS = {
     "amazon": lambda query: f"https://www.amazon.in/s?k={urllib.parse.quote_plus(query)}",
@@ -17,6 +18,28 @@ SITE_URL_BUILDERS = {
 }
 
 DEFAULT_SITE = "duckduckgo"
+
+def ask_ollama (model: str, prompt: str, stream=False) -> str:
+    url = "http://localhost:11434/api/generate"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": stream
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+
+    if stream:
+        output = ""
+        for line in response.iter_lines():
+            if line:
+                chunk = json.loads(line.decode("utf-8"))
+                output += chunk.get("response", "")
+        return output
+    else:
+        return response.json().get("response", "")
 
 def extract_search_terms(structured_query):
     """Extract clean search terms from structured query"""
@@ -73,17 +96,8 @@ def create_fallback_query(user_input: str) -> Dict:
 def query_llama(user_input: str) -> Optional[Dict]:
     """Uses Ollama to extract structured info with robust JSON parsing"""
     try:
-        process = subprocess.run(
-            ["ollama", "run", "query-llama"],
-            input=user_input,
-            text=True,
-            capture_output=True,
-            timeout=30
-        )
-        stdout = process.stdout
-        
-        # Robust JSON extraction
-        json_match = re.search(r'\{[\s\S]*\}', stdout)
+        response_text = ask_ollama("query-llama", user_input)
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
         if not json_match:
             print("⚠️ LLM didn't return valid JSON, creating fallback query...")
             return create_fallback_query(user_input)
@@ -112,15 +126,8 @@ def ask_follow_up_questions(user_input: str, structured_query: Dict) -> List[str
     **Structured Query**: {json.dumps(structured_query, indent=2)}
     """
     try:
-        process = subprocess.run(
-            ["ollama", "run", "follow-ups"],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            timeout=20
-        )
-        stdout = process.stdout
-        json_match = re.search(r'\[[\s\S]*\]', stdout)
+        response_text = ask_ollama("follow-ups", prompt)
+        json_match = re.search(r'\[[\s\S]*\]', response_text)
         return json.loads(json_match.group(0)) if json_match else []
     except Exception as e:
         print(f"⚠️ Could not generate questions: {str(e)}")
@@ -140,15 +147,8 @@ def refine_structured_query_with_answers(original_input: str, answers: List[str]
         Output only the updated structured query as JSON:
     """
     try:
-        process = subprocess.run(
-            ["ollama", "run", "refine-query"],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            timeout=30
-        )
-        stdout = process.stdout
-        json_match = re.search(r'\{[\s\S]*\}', stdout)
+        response_text = ask_ollama("refine-query", prompt)
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
 
         result = json.loads(json_match.group(0)) if json_match else previous_query
 
@@ -483,10 +483,10 @@ def main():
             
             save_option = input("\n💾 Save results? (csv/xlsx/none): ").strip().lower()
             if save_option == 'csv':
-                filename = input("\n What would you like to name the file?").strip().lower()
+                filename = input("\n What would you like to name the file? ").strip().lower()
                 save_to_dataframe(results, filename)
             elif save_option == 'xlsx':
-                filename = input("\n What would you like to name the file?").strip().lower()
+                filename = input("\n What would you like to name the file? ").strip().lower()
                 save_to_excel(results, filename)
         else:
             print("❌ Invalid option. Please choose csv/xlsx/none.")
