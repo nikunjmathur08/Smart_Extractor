@@ -20,6 +20,7 @@ A dynamic terminal-based web scraper with full voice control capabilities. Liter
 - **Dynamic Content Handling**: Handles JavaScript-heavy sites
 - **Robust Error Handling**: Graceful failure recovery
 - **Rate Limiting**: Respectful scraping practices
+- **Waits for Images**: Waits for images to load on a website and then begin scraping
 
 ### Supported Websites
 
@@ -76,8 +77,22 @@ Each model uses carefully crafted prompts stored in the `modelFiles/` directory,
    curl -fsSL https://ollama.ai/install.sh | sh
    
    # Pull the LLaMA 3.1 8B model
-   ollama pull llama3.1:8b
+   ollama pull llama3.1:8b-instruct-q4_K_M
    ```
+5. **Configure respective models**
+    ```bash
+    # Install QueryLlama model
+    > cd modelFiles
+    > ollama create query-llama -f QueryLlama.modelfile
+
+    # Install FollowUps model
+    > cd modelFiles
+    > ollama create follow-ups -f AskFollowUps.modelfile
+
+    # Install RefineQuery model
+    > cd modelFiles
+    > ollama create refine-query -f RefineQuery.modelfile
+    ```
 
 4. **Configure audio settings**
    - Ensure your microphone is working and properly configured
@@ -98,9 +113,8 @@ python full_speech.py
 ```
 
 Then simply speak your scraping request:
-- "Extract all product prices from Amazon's laptop section"
-- "Get news headlines from technology websites"
-- "Scrape job listings for Python developers"
+- "I want to buy a MacBook from Amazon"
+- "I am looking for healthy snacks on Walmart"
 
 ## How It Works
 
@@ -149,15 +163,14 @@ Using Crawl4AI, it executes the scraping with:
 
 ```
 Smart_Extractor/
-├── modelFiles/          # Specialized AI models for different tasks
-├── prompts/            # Prompt engineering and optimization
+├── modelFiles/         # Specialized AI models for different tasks
 ├── trials/             # Experimental implementations
 ├── full_extract.py     # Main text-based scraping program
 ├── full_speech.py      # Main voice-controlled program
 ├── chairs.xlsx         # Sample output file
 ├── requirements.txt    # Python dependencies
-├── README.md          # This file
-└── .gitignore         # Git ignore rules
+├── README.md           # This file
+└── .gitignore          # Git ignore rules
 ```
 
 ### Core Components
@@ -186,7 +199,7 @@ Smart Extractor
 ### Key Technologies
 
 - **Ollama**: Local AI model inference
-- **LLaMA 3.1 8B**: Language understanding and generation
+- **LLaMA 3.1 8B-instruct-q4_K_M**: Language understanding and generation
 - **Crawl4AI**: Advanced web scraping framework
 - **SpeechRecognition**: Voice input processing
 - **macOS `say` command**: Native text-to-speech with Samantha voice
@@ -201,7 +214,7 @@ Smart Extractor
 🤖 Bot: "What specific products are you looking for?"
 🎤 You: "Laptops under $1000"
 🤖 Bot: "Which e-commerce sites should I target?"
-🎤 You: "Amazon and Best Buy"
+🎤 You: "Amazon and Walmart"
 🤖 Bot: "What information do you need? Price, specs, reviews?"
 🎤 You: "Price, model name, and customer ratings"
 🤖 Bot: "Starting extraction..."
@@ -290,12 +303,6 @@ Example files are saved in the project directory (e.g., `chairs.xlsx`).
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
-
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
@@ -341,7 +348,7 @@ Please use Smart Extractor responsibly:
 - [Documentation](docs/)
 - [Issue Tracker](https://github.com/nikunjmathur08/Smart_Extractor/issues)
 - [Discussions](https://github.com/nikunjmathur08/Smart_Extractor/discussions)
-- [Contact](mailto:your-email@example.com)
+- [Contact](mailto:nikunjmathur0810@gmail.com)
 
 ## Acknowledgments
 
