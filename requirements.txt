@@ -1,0 +1,7 @@
+crawl4ai
+re
+asyncio
+subprocess
+urllib
+pandas
+speech_recognition
