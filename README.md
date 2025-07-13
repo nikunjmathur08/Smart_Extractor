@@ -305,7 +305,11 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is currently under review for licensing terms. All contributions will be subject to the final license as determined by the project maintainer.
+
+For now, assume **personal and educational use only**, with no commercial redistribution or derivative works unless explicitly permitted.
+
+See the [LICENSE](LICENSE) file for the most up-to-date licensing information. If you have questions, please reach out via Issues or email.
 
 ## Ethical Usage
 
