@@ -8,10 +8,57 @@ from typing import List, Dict, Optional
 import urllib.parse
 import pandas as pd
 import requests
+import speech_recognition as sr
+
+def speak(text):
+    subprocess.run(['say', '-v', 'Samantha', text])
+
+def get_voice_input(prompt="🎤 Please speak your query: ") -> str:
+    recognizer = sr.Recognizer()
+    mic = sr.Microphone()
+
+    speak(prompt)
+    print("🎤 Listening...")
+
+    with mic as source:
+        recognizer.adjust_for_ambient_noise(source)
+        audio = recognizer.listen(source)
+    
+    try:
+        query = recognizer.recognize_google(audio)
+        print(f"You said: {query}")
+        return query
+    except sr.UnknownValueError:
+        print("Could not understand audio.")
+        speak("Could not understand audio.")
+        return ""
+    except sr.RequestError as e:
+        print(f"Could not request results; {e}")
+        speak("Sorry I am having trouble reaching the speech service.")
+        return ""
+
+def listen(prompt: str = None) -> str:
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        if prompt:
+            speak(prompt)
+        print("🎤 Listening...")
+        audio = r.listen(source, timeout=5, phrase_time_limit=12)
+    try:
+        query = r.recognize_google(audio)
+        print(f"You said: {query}")
+        return query
+    except sr.UnknownValueError:
+        speak("Sorry, I didn't quite catch that.")
+        return ""
+    except sr.RequestError:
+        speak("Speech recognition is unavailable.")
+        return ""
 
 SITE_URL_BUILDERS = {
     "amazon": lambda query: f"https://www.amazon.in/s?k={urllib.parse.quote_plus(query)}",
     "flipkart": lambda query: f"https://www.flipkart.com/search?q={urllib.parse.quote(query, safe='')}",
+    "walmart": lambda query: f"https://www.walmart.com/search?q={urllib.parse.quote(query, safe='')}",
     "croma": lambda query: f"https://www.croma.com/searchB?q={urllib.parse.quote(query, safe='')}%3Arelevance&text={urllib.parse.quote(query, safe='')}",
     "tatacliq": lambda query: f"https://www.tatacliq.com/search/?searchCategory={urllib.parse.quote_plus(query)}",
     "duckduckgo": lambda query: f"https://duckduckgo.com/?q={urllib.parse.quote_plus(query)}",
@@ -414,82 +461,94 @@ def save_to_excel(products: List[Dict], filename: str = "scraped_products.xlsx")
 
 def main():
     """Main function with improved error handling"""
-    print("🛒 Smart Product Scraper")
+    print("🛒 Smart Product Scraper (Voice Enabled)")
     print("=" * 50)
     
     while True:
-        print("\n🔍 What would you like to scrape? (or type 'exit')")
-        print("1. Simple URL scraping")
-        print("2. Intelligent prompt-based scraping")
+        user_input = get_voice_input("What would you like to do? Say '1' for URL scraping, '2' for prompt scraping, or 'exit':").strip().lower()
         
-        user_input = input("\n→ Choose option (1/2) or 'exit': ").strip()
-        
-        if user_input.lower() == 'exit':
-            print("👋 Goodbye!")
+        if "exit" in user_input:
+            speak("Goodbye!")
+            print("Goodbye!")
             break
 
-        elif user_input == '1':
-            url = input("\n🌐 Enter the URL to scrape: ").strip()
+        elif '1' in user_input or 'one' in user_input:
+            speak("Please type the URL you want to scrape.")
+            url = input("Enter the URL: ").strip()
             if not url:
-                print("❌ No URL provided")
+                speak("No URL received.")
+                print("No URL received.")
                 continue
-                
-            print(f"🔍 Scraping: {url}")
+
+            speak(f"Scraping the page you requested.")
+            print(f"Scraping {url}")
             products = asyncio.run(url_scraper(url))
-            
+
             if products:
-                save_option = input("\n💾 Save results to CSV? (y/n): ").strip().lower()
-                if save_option == 'y':
+                save_option = get_voice_input("Scraping complete! Say yes to save results or no to skip: ").strip().lower()
+                if 'yes' in save_option:
                     save_to_dataframe(products)
-            
-        elif user_input == '2':
-            user_prompt = input("\n🗣️ Enter your product search prompt: ").strip()
+                else:
+                    speak("No products found.")
+        
+        elif "2" in user_input or "two" in user_input:
+            user_prompt = get_voice_input("What would you like to search for?").strip()
             if not user_prompt:
-                print("❌ No prompt provided")
+                speak("No prompt detected. Please try again.")
+                print("No prompt detected. Please try again.")
                 continue
-
-            print("🤖 Processing your request...")
+            
+            speak("Processing your request.")
+            print("Processing your request...")
             structured = query_llama(user_prompt)
-            
+
             if not structured:
-                print("❌ Could not parse your query. Please try again.")
+                speak("Sorry, I couldn't understand. Please try again.")
+                print("Sorry, I couldn't understand. Please try again.")
                 continue
 
-            print("✅ Query parsed successfully!")
-            
             questions = ask_follow_up_questions(user_prompt, structured)
+
             if questions:
-                print("\n🤖 I have a few questions to refine your search:")
+                speak("I have a few questions to refine your search.")
                 user_answers = []
                 for q in questions:
-                    ans = input(f"→ {q} ").strip()
+                    ans = get_voice_input(f"🎤 {q}").strip()
                     user_answers.append(ans)
                 structured = refine_structured_query_with_answers(user_prompt, user_answers, structured)
-                print("✅ Query refined with your answers!")
+                speak("Search refined!")
+                print("Search refined!")
 
             structured["query"] = sanitize_query(structured.get("query", user_prompt))
 
-            print("\n📋 Final Search Configuration:")
+            print("Final configuration: ")
             print(json.dumps(structured, indent=2))
 
-            print("\n🚀 Starting scraping process...")
-            results = asyncio.run(run_crawl4ai_scraper(structured))
-            
+            speak("Starting the scraping process.")
+            results =  asyncio.run(run_crawl4ai_scraper(structured))
+
             if not results:
-                print("\n⚠️ No products found matching your criteria.")
+                speak("No results found.")
+                speak("No results found.")
                 continue
 
             display_results(results)
-            
-            save_option = input("\n💾 Save results? (csv/xlsx/none): ").strip().lower()
-            if save_option == 'csv':
-                filename = input("\n What would you like to name the file? ").strip().lower()
+
+            speak("Would you like to save the results as CSV or Excel?")
+            save_option = get_voice_input("🎤 Say 'CSV', 'Excel', or 'None': ").strip().lower()
+
+            if "csv" in save_option:
+                speak("Please say the file name.")
+                filename = get_voice_input("🎤 Say the file name for CSV: ").strip()
                 save_to_dataframe(results, filename)
-            elif save_option == 'xlsx':
-                filename = input("\n What would you like to name the file? ").strip().lower()
+            elif "excel" in save_option or "xlsx" in save_option:
+                speak("Please say the file name.")
+                filename = get_voice_input("🎤 Say the file name for Excel: ").strip()
                 save_to_excel(results, filename)
+
         else:
-            print("❌ Invalid option. Please choose csv/xlsx/none.")
+            speak("Sorry, I didn't get that. Please say one, two or exit.")
+            print("Sorry, I didn't get that. Please say one, two or exit.")
 
 if __name__ == "__main__":
     main()

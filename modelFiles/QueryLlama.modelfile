@@ -63,6 +63,18 @@ Parse the user input and return structured JSON with these keys ONLY:
     "query": "television under 80000"
 }
 
+**Input**: "healthy snacks on walmart"
+{
+    "site": "walmart",
+    "product_type": "snacks",
+    "min_price": 0,
+    "max_price": 999999,
+    "sort_order": "asc",
+    "additional_filters": ["healthy"],
+    "goal": "healthy snacks on walmart",
+    "query": "healthy snacks on walmart"
+}
+
 ## Important Notes
 - Always return valid JSON only, no additional text
 - Use null for optional fields when no relevant information is found
