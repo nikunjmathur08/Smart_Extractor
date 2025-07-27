@@ -5,9 +5,9 @@ import subprocess
 import urllib.parse
 from crawl4ai import *
 from typing import List, Dict, Optional
-import urllib.parse
 import pandas as pd
 import requests
+from more_itertools import chunked
 
 SITE_URL_BUILDERS = {
     "amazon": lambda query: f"https://www.amazon.in/s?k={urllib.parse.quote_plus(query)}",
@@ -40,6 +40,51 @@ def ask_ollama (model: str, prompt: str, stream=False) -> str:
         return output
     else:
         return response.json().get("response", "")
+
+def extract_detailed_product_info(blocks: List[str], chunk_size: int = 10) -> List[Dict]:
+    extracted = []
+    chunks = dynamic_chunk(blocks)
+
+    for idx, chunk in enumerate(chunks, 1):
+        joined = "\n\n---\n\n".join(chunk)
+        print(joined)
+        prompt = f"""
+            Now extract from these blocks:
+            {joined}
+        """
+        try:
+            response_text = ask_ollama("extract-details", prompt)
+            response_text = response_text.strip()
+            if response_text.startswith('[') and response_text.endswith(']'):
+                batch_data = json.loads(response_text)
+                extracted.extend(batch_data)
+            else:
+                json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*\]', response_text)
+                if json_match:
+                    batch_data = json.loads(json_match.group(0))
+                    extracted.extend(batch_data)
+                else:
+                    print(f"No valid JSON array returned for chunk #{idx}")
+        except Exception as e:
+            print(f"⚠️ Failed to extract batch #{idx}: {e}")
+    return extracted
+
+def dynamic_chunk(blocks, max_chars = 12000):
+    chunks = []
+    current_chunk = []
+    current_len = 0
+    for block in blocks:
+        block_len = len(block)
+        if current_len + block_len + len("\n\n---\n\n") > max_chars:
+            chunks.append(current_chunk)
+            current_chunk = [block]
+            current_len = block_len
+        else:
+            current_chunk.append(block)
+            current_len += block_len + len("\n\n---\n\n")
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
 
 def extract_search_terms(structured_query):
     """Extract clean search terms from structured query"""
@@ -238,11 +283,19 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
                     print(f"❌ Failed to scrape page {i}: {result.error_message}")
                     continue
 
-                page_products = parse_products_from_markdown(
-                    result.markdown,
-                    structured.get("min_price", 0),
-                    structured.get("max_price", 999999)
-                )
+                # Split markdown into potential product blocks
+                product_blocks = split_markdown_to_product_blocks(result.markdown)
+                
+                # Extract detailed info using LLM for each block
+                detailed_products = extract_detailed_product_info(product_blocks)
+                page_products = []
+                for product in detailed_products:
+                    if product and product.get('title') and product.get('price') is not None:
+                        price = product['price']
+                        min_price = structured.get('min_price', 0)
+                        max_price = structured.get('max_price', 999999)
+                        if min_price <= price <= max_price:
+                            page_products.append(product)
 
                 all_products.extend(page_products)
                 print(f"✅ Found {len(page_products)} products on page {i}")
@@ -283,11 +336,17 @@ async def url_scraper(url: str, min_price: int = 0, max_price: int = 999999) -> 
                 print(f"❌ Failed to scrape: {result.error_message}")
                 return []
             
-            products = parse_products_from_markdown(
-                result.markdown,
-                min_price=min_price,
-                max_price=max_price
-            )
+            # Split markdown into potential product blocks
+            product_blocks = split_markdown_to_product_blocks(result.markdown)
+            
+            # Extract detailed info using LLM for each block
+            detailed_products = extract_detailed_product_info(product_blocks)
+            products = []
+            for product in detailed_products:
+                if product and product.get('title') and product.get('price') is not None:
+                    price = product['price']
+                    if min_price <= price <= max_price:
+                        products.append(product)
 
             if products:
                 print(f"✅ Found {len(products)} product(s):\n")
@@ -303,6 +362,12 @@ async def url_scraper(url: str, min_price: int = 0, max_price: int = 999999) -> 
         print(f"❌ Scraping error: {str(e)}")
         return []
 
+def split_markdown_to_product_blocks(markdown: str) -> List[str]:
+    """Split markdown into potential product blocks using common patterns"""
+    # Improved split on headings, bold items, or price lines
+    blocks = re.split(r'(?m)^(?:#+\s.*?$|\*\*.*?\*\*|\d+\.\s.*?$|₹[\d,]+|Rs\.[\d,]+)', markdown)
+    return [b.strip() for b in blocks if b.strip() and len(b) > 20]  # Filter short/irrelevant blocks
+
 def clean_markdown_to_text(markdown: str) -> str:
     """Clean markdown and convert to readable text"""
     markdown = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', markdown)  # keep link text only
@@ -310,43 +375,6 @@ def clean_markdown_to_text(markdown: str) -> str:
     markdown = re.sub(r'#+ ', '', markdown)  # headings
     markdown = re.sub(r'\s{2,}', ' ', markdown)  # excess whitespace
     return markdown.strip()
-
-def parse_products_from_markdown(markdown: str, min_price: int, max_price: int) -> List[Dict]:
-    """Robust product parsing with improved pattern matching"""
-    products = []
-    
-    # Combined pattern for product blocks
-    product_block_pattern = re.compile(
-        r'(?:^|\n)(?P<title>(?:#+\s*|\d+\.\s+|\*{2})\s*(.*?))\s*\n' # Capture full title line
-        r'(?:.*?)(?P<price>₹\s*[\d,]+|Rs\.\s*[\d,]+|INR\s*[\d,]+)'  # Price capture
-        r'(?:.*?)(?P<link>\[[^\]]*\]\(https?:\/\/[^\)]+\))?'        # Optional link
-        r'(?:.*?)(?P<image>!\[[^\]]*\]\(https?:\/\/[^\)]+\))?',     # Optional image
-        re.DOTALL
-    )
-    
-    for match in product_block_pattern.finditer(markdown):
-        title = re.sub(r'^[#\d\.\*\s]+', '', match.group(1)).strip()
-        
-        try:
-            price_str = re.search(r'[\d,]+', match.group('price')).group().replace(',', '')
-            price = int(price_str)
-        except (AttributeError, ValueError):
-            continue
-            
-        if not (min_price <= price <= max_price):
-            continue
-            
-        link_match = re.search(r'\((https?://[^\)]+)\)', match.group('link') or '')
-        image_match = re.search(r'\((https?://[^\)]+)\)', match.group('image') or '')
-        
-        products.append({
-            "title": title,
-            "price": price,
-            "link": link_match.group(1) if link_match else None,
-            "image": image_match.group(1) if image_match else None
-        })
-    
-    return products
 
 def sanitize_query(text: str) -> str:
     """Clean and sanitize search query"""
@@ -360,28 +388,21 @@ def display_results(products: List[Dict]) -> None:
     if not products:
         print("📭 No products to display")
         return
-        
+    
     print(f"\n🛍️ Found {len(products)} products:")
     print("=" * 80)
-    
+
     for i, item in enumerate(products, 1):
-        title = item.get("title", "No title")
-        price = f"₹{item['price']:,}" if item.get("price") else "Price not available"
-        link = item.get("link", "")
-        image = item.get("image", "")
-
-        parts = title.split(" | ", 1)
-        main_title = parts[0].strip()
-        description = parts[1].strip() if len(parts) > 1 else ""
-
-        print(f"\n{i}. 🛒 {main_title}")
-        print(f"   💰 Price: {price}")
-        if link:
-            print(f"   🔗 Link: {link}")
-        if image:
-            print(f"   🖼️ Image: {image}")
-        if description:
-            print(f"   📦 Details: {description}")
+        print(f"\n{i}. 🛒 {item.get('title', 'No title')}")
+        print(f"   💰 Price: ₹{item.get('price'):,}" if item.get('price') else "   💰 Price: Not available")
+        print(f"   ⭐ Rating: {item.get('rating', 'N/A')}")
+        print(f"   🏷️ Tags: {', '.join(item.get('tags') or [])}")
+        print(f"   🎁 Offers: {item.get('offers', 'N/A')}")
+        print(f"   🔻 Discounts: {item.get('discounts', 'N/A')}")
+        print(f"   📦 Quantity: {item.get('quantity', 'N/A')}")
+        print(f"   🔖 Category Properties:")
+        for k, v in (item.get('category_properties') or {}).items():
+            print(f"      - {k}: {v}")
         print("-" * 80)
 
 def save_to_dataframe(products: List[Dict], filename: str = "scraped_products.csv") -> None:
@@ -410,7 +431,7 @@ def save_to_excel(products: List[Dict], filename: str = "scraped_products.xlsx")
         df.to_excel(filename, index=False)
         print(f"💾 Results saved to {filename}")
     except Exception as e:
-        print(f"❌ Error saving to CSV: {str(e)}")
+        print(f"❌ Error saving to Excel: {str(e)}")
 
 def main():
     """Main function with improved error handling"""
@@ -489,7 +510,7 @@ def main():
                 filename = input("\n What would you like to name the file? ").strip().lower()
                 save_to_excel(results, filename)
         else:
-            print("❌ Invalid option. Please choose csv/xlsx/none.")
+            print("❌ Invalid option. Please choose 1 or 2.")
 
 if __name__ == "__main__":
     main()
