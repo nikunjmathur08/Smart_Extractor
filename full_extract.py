@@ -25,10 +25,14 @@ def ask_ollama (model: str, prompt: str, stream=False) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
-        "stream": stream
+        "stream": stream,
+        "options": {
+            "num_ctx": 8192,
+            "temperature": 0.1
+        }
     }
 
-    response = requests.post(url, headers=headers, json=payload, timeout=60)
+    response = requests.post(url, headers=headers, json=payload, timeout=120)
     response.raise_for_status()
 
     if stream:
@@ -41,35 +45,106 @@ def ask_ollama (model: str, prompt: str, stream=False) -> str:
     else:
         return response.json().get("response", "")
 
-def extract_detailed_product_info(blocks: List[str], chunk_size: int = 10) -> List[Dict]:
+def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dict]:
     extracted = []
-    chunks = dynamic_chunk(blocks)
+    chunks = dynamic_chunk(blocks, max_chars=6000)
 
     for idx, chunk in enumerate(chunks, 1):
         joined = "\n\n---\n\n".join(chunk)
-        print(joined)
+        print(f"Sending chunk {idx} to LLM, length = {len(joined)} chars: {joined[:200]}...")
         prompt = f"""
-            Now extract from these blocks:
-            {joined}
+        Ignore navigation, headers or non-product text. Extract only product details from these blocks as a JSON array of objects. Each object should have:
+        - "title": string (e.g., full product name)
+        - "price": number (e.g., main price in INR, without currency symbol)
+        - "rating": string (e.g., "4.5 out of 5" or "4.5 stars"; use null if unavailable)
+        - "tags": array of strings (keywords like ["electronics", "smartphone"]; empty array [] if none)
+        - "offers": string (e.g., "Buy 1 Get 1 Free", "Save extra with No Cost EMI"; use null if unavailable)
+        - "discounts": string (e.g., "20% off"; use null if unavailable)
+        - "quantity": string (e.g., "In stock" or "5 left"; use null if unavailable)
+        - "category_properties": object (key-value pairs for specs, e.g., {{"color": "black", "storage": "128GB"}}; empty object {{}} if none)
+
+        Rules:
+        - Process each block independently. If a block has multiple products, create separate objects.
+        - If no valid products are found in the entire input, return an empty array [].
+        - Ignore irrelevant content like ads or navigation.
+        - DO NOT compare products, analyze, or add any text—extract ONLY the fields above.
+        - Output ONLY a valid JSON array like [{...}, {...}]. No code blocks, explanations, or extra text. If you start comparing, stop and return [].
+
+        Blocks:
+        {joined}
         """
         try:
             response_text = ask_ollama("extract-details", prompt)
+            print(f"DEBUG: LLM response for chunk {idx}: {response_text[:200]}...")
             response_text = response_text.strip()
             if response_text.startswith('[') and response_text.endswith(']'):
                 batch_data = json.loads(response_text)
                 extracted.extend(batch_data)
             else:
-                json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*\]', response_text)
+                json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*]', response_text)
                 if json_match:
                     batch_data = json.loads(json_match.group(0))
                     extracted.extend(batch_data)
                 else:
-                    print(f"No valid JSON array returned for chunk #{idx}")
-        except Exception as e:
-            print(f"⚠️ Failed to extract batch #{idx}: {e}")
-    return extracted
+                    print(f"No valid JSON from LLM for chunk: {idx}-falling back to regex")
 
-def dynamic_chunk(blocks, max_chars = 12000):
+                    for block in chunk:
+                        title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', chunk)
+                        price_match = re.search(r'₹([\d,]+)', block)
+                        rating_match = re.search(r'(\d\.\d) out of 5', block)
+                        offers_match = re.search(r'(Save extra with .+)', block)
+                        discount_match = re.search(r'(\d+% off)', block)
+
+                        if title_match and price_match:
+                            title = title_match.group(1).strip()
+                            if any(kw.lower() in title.lower() for kw in keywords):
+                                entry = {
+                                    "title": title,
+                                    "price": int(price_match.group(1).replace(",", "")),
+                                    "rating": rating_match.group(1) if rating_match else None,
+                                    "offers": offers_match.group(1) if offers_match else None,
+                                    "discounts": discount_match.group(1) if discount_match else None,
+                                    "tags": [],
+                                    "quantity": None,
+                                    "category_properties": {}
+                                }
+                                extracted.append(entry)
+                                print(f"DEBUG: Regex extracted: {entry}")
+        except Exception as e:
+            print(f"LLM error for chunk {idx}: {e}-skipping to fallback")
+            for block in chunk:
+                title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', chunk)
+                price_match = re.search(r'₹([\d,]+)', block)
+                rating_match = re.search(r'(\d\.\d) out of 5', block)
+                offers_match = re.search(r'(Save extra with .+)', block)
+                discount_match = re.search(r'(\d+% off)', block)
+
+                if title_match and price_match:
+                    title = title_match.group(1).strip()
+                    if any(kw.lower() in title.lower() for kw in keywords):
+                        entry = {
+                            "title": title,
+                            "price": int(price_match.group(1).replace(",", "")),
+                            "rating": rating_match.group(1) if rating_match else None,
+                            "offers": offers_match.group(1) if offers_match else None,
+                            "discounts": discount_match.group(1) if discount_match else None,
+                            "tags": [],
+                            "quantity": None,
+                            "category_properties": {}
+                        }
+                        extracted.append(entry)
+                        print(f"DEBUG: Regex extracted: {entry}")
+    print(f"DEBUG: Total extracted products: {len(extracted)}")
+    seen_titles = set()
+    unique_extracted = []
+    for prod in extracted:
+        if prod['title'] not in seen_titles:
+            seen_titles.add(prod['title'])
+            unique_extracted.append(prod)
+    print(f"\nDEBUG: Total unique extracted products: {len(unique_extracted)}")
+    return unique_extracted
+
+def dynamic_chunk(blocks, max_chars = 8000):
     chunks = []
     current_chunk = []
     current_len = 0
@@ -85,6 +160,21 @@ def dynamic_chunk(blocks, max_chars = 12000):
     if current_chunk:
         chunks.append(current_chunk)
     return chunks
+
+def cleaned_markdown(markdown: str) -> str:
+    """Removes noise from data scraped without erasing products"""
+    # More targeted removals
+    markdown = re.sub(r'## Skip to.*Keyboard shortcuts.*To move between items.*', '', markdown, flags=re.DOTALL | re.IGNORECASE)  # Remove specific header
+    markdown = re.sub(r'Your Lists.*Your Account.*', '', markdown, flags=re.DOTALL)  # Account section
+    markdown = re.sub(r'Sort by:.*Newest Arrivals.*', '', markdown, flags=re.DOTALL)  # Sort bar
+    markdown = re.sub(r'\[SponsoredSponsored \].*?\[Let us know \].*?', '', markdown, flags=re.DOTALL)  # Sponsored, limited scope
+    markdown = re.sub(r'!\[.*?\]\(.*?\)', '', markdown)  # Images
+    markdown = re.sub(r'\[.*?\]\(.*?\)', lambda m: m.group(1) if 'http' not in m.group(0) else '', markdown)  # Links
+    markdown = re.sub(r'© 1996-2025, Amazon.com.*', '', markdown)  # Footer
+
+    lines = markdown.split('\n')
+    preserved = [line for line in lines if re.search(r'₹[\d,]+|\*\*.*\*\*', line, re.IGNORECASE)]  # Keep relevant
+    return '\n'.join(preserved).strip()
 
 def extract_search_terms(structured_query):
     """Extract clean search terms from structured query"""
@@ -276,38 +366,59 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
     try:
         async with AsyncWebCrawler(config=browser_conf) as crawler:
             for i, url in enumerate(paginated_urls, start=1):
-                print(f"🔍 Scraping page {i}: {url}")
-                result = await crawler.arun(url=url, config=run_conf)
-            
-                if not result.success:
-                    print(f"❌ Failed to scrape page {i}: {result.error_message}")
-                    continue
+                try:
+                    print(f"🔍 Scraping page {i}: {url}")
+                    result = await crawler.arun(url=url, config=run_conf)
 
-                # Split markdown into potential product blocks
-                product_blocks = split_markdown_to_product_blocks(result.markdown)
-                
-                # Extract detailed info using LLM for each block
-                detailed_products = extract_detailed_product_info(product_blocks)
-                page_products = []
-                for product in detailed_products:
-                    if product and product.get('title') and product.get('price') is not None:
-                        price = product['price']
-                        min_price = structured.get('min_price', 0)
-                        max_price = structured.get('max_price', 999999)
-                        if min_price <= price <= max_price:
-                            page_products.append(product)
+                    if not result or not result.success:
+                        print(f"❌ Failed to scrape page {i}: {getattr(result, 'error_message', 'No result')}")
+                        continue
 
-                all_products.extend(page_products)
-                print(f"✅ Found {len(page_products)} products on page {i}")
+                    # Save the raw markdown for debug purposes, but DO NOT break!
+                    print("Saving data to markdown file...")
+                    with open(f"debug_page_{i}.md", "w", encoding="utf-8") as f:
+                        f.write(result.markdown or '')
 
-                await asyncio.sleep(2)
-                
-        print(f"🎉 Total products found: {len(all_products)}")
-        return all_products
+                    keywords = structured.get('query', '').lower().split()
+                    product_blocks = split_markdown_to_product_blocks(result.markdown, keywords)
+
+                    if product_blocks:
+                        with open(f"product_block_{i}.md", "w", encoding="utf-8") as p:
+                            p.write("\n---\n".join(product_blocks))
+                        print(f"Saved {len(product_blocks)} blocks to product_block_{i}.md")
+
+                    else:
+                        print(f"DEBUG: No blocks saved for page {i}")
+                    if not product_blocks:
+                        print(f"No product blocks found from page {i} (markdown length: {len(result.markdown)})")
+                        continue
+
+                    # Extract detailed info using LLM for each block
+                    detailed_products = extract_detailed_product_info(product_blocks, keywords)
+                    page_products = []
+                    for product in detailed_products:
+                        print(f"DEBUG: Extracted product: {product}")  # Print every candidate for debug!
+                        if product and product.get('title') and product.get('price') is not None and any(kw.lower() in product['title'].lower() for kw in keywords):
+                            price = product['price']
+                            min_price = structured.get('min_price', 0)
+                            max_price = structured.get('max_price', 999999)
+                            if min_price <= price <= max_price:
+                                page_products.append(product)
+
+                    all_products.extend(page_products)
+                    print(f"✅ Found {len(page_products)} products on page {i}")
+
+                    await asyncio.sleep(2)
+
+                except Exception as e:
+                    print(f"Error scraping using run_crawl4ai_scraper: {e}")
+
+            print(f"🎉 Total products found: {len(all_products)}")
+            return all_products
     except Exception as e:
         print(f"⚠️ Scraping error: {str(e)}")
         return []
-    
+
 async def url_scraper(url: str, min_price: int = 0, max_price: int = 999999) -> List[Dict]:
     """Scrape a single URL"""
     config = CrawlerRunConfig(
@@ -362,11 +473,29 @@ async def url_scraper(url: str, min_price: int = 0, max_price: int = 999999) -> 
         print(f"❌ Scraping error: {str(e)}")
         return []
 
-def split_markdown_to_product_blocks(markdown: str) -> List[str]:
-    """Split markdown into potential product blocks using common patterns"""
-    # Improved split on headings, bold items, or price lines
-    blocks = re.split(r'(?m)^(?:#+\s.*?$|\*\*.*?\*\*|\d+\.\s.*?$|₹[\d,]+|Rs\.[\d,]+)', markdown)
-    return [b.strip() for b in blocks if b.strip() and len(b) > 20]  # Filter short/irrelevant blocks
+def split_markdown_to_product_blocks(markdown: str, query_keywords: list = None) -> list:
+    if query_keywords is None:
+        query_keywords = []
+    
+    blocks = re.split(r'(?:\n\s*\n+|^#+\s|\n#+\s|\[!\[|\nPrice,\sproduct\spage)', markdown, flags=re.IGNORECASE)
+    debug_content = "\n---\n".join(blocks)
+    with open("product_blocks.md", "w", encoding="utf-8") as f:
+        f.write(debug_content)
+        print(f"Debug info saved to product_blocks.md, length = {len(debug_content)}")
+    
+    filtered_blocks = []
+    for b in blocks:
+        b.strip()
+        if len(b) > 50 and ('₹' in b or all(kw.lower() in b.lower() for kw in query_keywords)):
+            filtered_blocks.append(b)
+
+    print(f"Total raw blocks: {len(blocks)}")
+    print(f"Total filtered blocks: {len(filtered_blocks)}")
+    if filtered_blocks:
+        print(f"Sample filtered block: {filtered_blocks[0][:500]}...")
+    else:
+        print("WARNING: No blocks passed filters-check regex or input markdown")
+    return filtered_blocks
 
 def clean_markdown_to_text(markdown: str) -> str:
     """Clean markdown and convert to readable text"""
