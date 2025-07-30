@@ -8,6 +8,7 @@ from typing import List, Dict, Optional
 import pandas as pd
 import requests
 from more_itertools import chunked
+import aiohttp
 
 SITE_URL_BUILDERS = {
     "amazon": lambda query: f"https://www.amazon.in/s?k={urllib.parse.quote_plus(query)}",
@@ -19,7 +20,7 @@ SITE_URL_BUILDERS = {
 
 DEFAULT_SITE = "duckduckgo"
 
-def ask_ollama (model: str, prompt: str, stream=False) -> str:
+async def ask_ollama (model: str, prompt: str, stream=False) -> str:
     url = "http://localhost:11434/api/generate"
     headers = {"Content-Type": "application/json"}
     payload = {
@@ -27,33 +28,35 @@ def ask_ollama (model: str, prompt: str, stream=False) -> str:
         "prompt": prompt,
         "stream": stream,
         "options": {
-            "num_ctx": 8192,
-            "temperature": 0.1
+            "num_ctx": 4096,
+            "temperature": 0
         }
     }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload, timeout=120) as response:
+            response.raise_for_status()
+            if stream:
+                output = ""
+                async for line in response.content.iter_any():
+                    if line:
+                        chunk = json.loads(line.decode("utf-8"))
+                        output += chunk.get("response", "")
+                return output
+            else:
+                data = await response.json()
+                return data.get("response", "")
 
-    response = requests.post(url, headers=headers, json=payload, timeout=120)
-    response.raise_for_status()
-
-    if stream:
-        output = ""
-        for line in response.iter_lines():
-            if line:
-                chunk = json.loads(line.decode("utf-8"))
-                output += chunk.get("response", "")
-        return output
-    else:
-        return response.json().get("response", "")
-
-def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dict]:
+async def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dict]:
     extracted = []
-    chunks = dynamic_chunk(blocks, max_chars=6000)
+    chunks = dynamic_chunk(blocks, max_chars=10000)
 
-    for idx, chunk in enumerate(chunks, 1):
+    async def process_chunk(idx, chunk):
         joined = "\n\n---\n\n".join(chunk)
-        print(f"Sending chunk {idx} to LLM, length = {len(joined)} chars: {joined[:200]}...")
+        print(f"\nSending chunk {idx} to LLM, length = {len(joined)} \nchars: {joined[:200]}...")
         prompt = f"""
-        Ignore navigation, headers or non-product text. Extract only product details from these blocks as a JSON array of objects. Each object should have:
+        You are a strict JSON extraction bot. Output ONLY a pure JSON array of product objects. No explanations, no text, no code-blocks only valid JSON.
+        If no products are found or input is invalid, output [] (empty array).
+        For each product, extract exactly:
         - "title": string (e.g., full product name)
         - "price": number (e.g., main price in INR, without currency symbol; extract the primary price, ignore discounts; use null if unavailable)
         - "rating": string (e.g., "4.5 out of 5" or "4.5 stars"; use null if unavailable)
@@ -70,50 +73,50 @@ def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dic
         - For price: Take the main listed price (e.g., ₹89,900 → 89900); ignore crossed-out or discount prices.
         - Output ONLY a valid JSON array like [{...}, {...}]. No code blocks, explanations, or extra text. If you start comparing, stop and return [].
 
+        Ignore ads, navigation, non-product text, sponsors text. Process independently per block.
+        Example output: [{"title": "iPhone 16", "price": 89900, "rating": "4.5 out of 5", "tags": ["smartphone"], "offers": null, "discounts": null, "quantity": "In stock", "category_properties": {{"storage": "256 GB"}}}]
+
         Blocks:
         {joined}
         """
+        batch = []
         try:
-            response_text = ask_ollama("extract-details", prompt)
-            print(f"DEBUG: LLM response for chunk {idx}: {response_text[:200]}...")
+            response_text = await ask_ollama("extract-details", prompt)
+            print(f"\nDEBUG: LLM response for chunk {idx}: {response_text[:200]}...")
             response_text = response_text.strip()
-            if response_text.startswith('[') and response_text.endswith(']'):
-                batch_data = json.loads(response_text)
-                extracted.extend(batch_data)
+            json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*]', response_text, re.DOTALL)
+            if json_match:
+                batch_data = json.loads(json_match.group(0))
+                batch.extend(batch_data)
             else:
-                json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*]', response_text)
-                if json_match:
-                    batch_data = json.loads(json_match.group(0))
-                    extracted.extend(batch_data)
-                else:
-                    print(f"No valid JSON from LLM for chunk: {idx}-falling back to regex")
+                print(f"No valid JSON from LLM for chunk: {idx}-falling back to regex")
 
-                    for block in chunk:
-                        title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', block)
-                        price_match = re.search(r'₹([\d,]+)', block)
-                        rating_match = re.search(r'(\d\.\d) out of 5', block)
-                        offers_match = re.search(r'(Save extra with .+)', block)
-                        discount_match = re.search(r'(\d+% off)', block)
+                for block in chunk:
+                    title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', block)
+                    price_match = re.search(r'₹([\d,]+)', block)
+                    rating_match = re.search(r'(\d\.\d) out of 5', block)
+                    offers_match = re.search(r'(Save extra with .+)', block)
+                    discount_match = re.search(r'(\d+% off)', block)
 
-                        if title_match and price_match:
-                            title = title_match.group(1).strip()
-                            if any(kw.lower() in title.lower() for kw in keywords):
-                                entry = {
-                                    "title": title,
-                                    "price": int(price_match.group(1).replace(",", "")),
-                                    "rating": rating_match.group(1) if rating_match else None,
-                                    "offers": offers_match.group(1) if offers_match else None,
-                                    "discounts": discount_match.group(1) if discount_match else None,
-                                    "tags": [],
-                                    "quantity": None,
-                                    "category_properties": {}
-                                }
-                                extracted.append(entry)
-                                print(f"DEBUG: Regex extracted: {entry}")
+                    if title_match and price_match:
+                        title = title_match.group(1).strip()
+                        if any(kw.lower() in title.lower() for kw in keywords):
+                            entry = {
+                                "title": title,
+                                "price": int(price_match.group(1).replace(",", "")),
+                                "rating": rating_match.group(1) if rating_match else None,
+                                "offers": offers_match.group(1) if offers_match else None,
+                                "discounts": discount_match.group(1) if discount_match else None,
+                                "tags": [],
+                                "quantity": None,
+                                "category_properties": {}
+                            }
+                            batch.append(entry)
+                            print(f"DEBUG: Regex extracted: {entry}")
         except Exception as e:
             print(f"LLM error for chunk {idx}: {e}-skipping to fallback")
             for block in chunk:
-                title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', chunk)
+                title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', block)
                 price_match = re.search(r'₹([\d,]+)', block)
                 rating_match = re.search(r'(\d\.\d) out of 5', block)
                 offers_match = re.search(r'(Save extra with .+)', block)
@@ -132,14 +135,20 @@ def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dic
                             "quantity": None,
                             "category_properties": {}
                         }
-                        extracted.append(entry)
+                        batch.append(entry)
                         print(f"DEBUG: Regex extracted: {entry}")
+            return batch
+            
+    tasks = [process_chunk(idx, chunk) for idx, chunk in enumerate(chunks, 1)]
+    results = await asyncio.gather(*tasks)
+    for batch in results:
+        extracted.extend(batch)
     print(f"DEBUG: Total extracted products: {len(extracted)}")
-    seen_titles = set()
+    seen = set()
     unique_extracted = []
     for prod in extracted:
-        if prod['title'] not in seen_titles:
-            seen_titles.add(prod['title'])
+        if (prod['title'], prod.get('price')) not in seen:
+            seen.add(prod['title'])
             unique_extracted.append(prod)
     print(f"\nDEBUG: Total unique extracted products: {len(unique_extracted)}")
     return unique_extracted
@@ -149,6 +158,8 @@ def dynamic_chunk(blocks, max_chars = 8000):
     current_chunk = []
     current_len = 0
     for block in blocks:
+        if len(block) < 100 or '₹' not in block:  # Pre-filter: Skip short/no-price blocks to reduce LLM load
+            continue
         block_len = len(block)
         if current_len + block_len + len("\n\n---\n\n") > max_chars:
             chunks.append(current_chunk)
@@ -228,10 +239,10 @@ def create_fallback_query(user_input: str) -> Dict:
         "query": cleaned_query
     }
 
-def query_llama(user_input: str) -> Optional[Dict]:
+async def query_llama(user_input: str) -> Optional[Dict]:
     """Uses Ollama to extract structured info with robust JSON parsing"""
     try:
-        response_text = ask_ollama("query-llama", user_input)
+        response_text = await ask_ollama("query-llama", user_input)
         json_match = re.search(r'\{[\s\S]*\}', response_text)
         if not json_match:
             print("⚠️ LLM didn't return valid JSON, creating fallback query...")
@@ -254,21 +265,21 @@ def query_llama(user_input: str) -> Optional[Dict]:
         print("⚠️ Ollama not found, creating fallback query...")
         return create_fallback_query(user_input)
 
-def ask_follow_up_questions(user_input: str, structured_query: Dict) -> List[str]:
+async def ask_follow_up_questions(user_input: str, structured_query: Dict) -> List[str]:
     """Ask follow-up questions based on the input using LLM"""
     prompt = f"""
     **User Input**: {user_input}
     **Structured Query**: {json.dumps(structured_query, indent=2)}
     """
     try:
-        response_text = ask_ollama("follow-ups", prompt)
+        response_text = await ask_ollama("follow-ups", prompt)
         json_match = re.search(r'\[[\s\S]*\]', response_text)
         return json.loads(json_match.group(0)) if json_match else []
     except Exception as e:
         print(f"⚠️ Could not generate questions: {str(e)}")
         return []
     
-def refine_structured_query_with_answers(original_input: str, answers: List[str], previous_query: Dict) -> Dict:
+async def refine_structured_query_with_answers(original_input: str, answers: List[str], previous_query: Dict) -> Dict:
     """Regenerate final structured query after follow-up answers."""
     prompt = f"""
         **Original Input**: {original_input}
@@ -282,7 +293,7 @@ def refine_structured_query_with_answers(original_input: str, answers: List[str]
         Output only the updated structured query as JSON:
     """
     try:
-        response_text = ask_ollama("refine-query", prompt)
+        response_text = await ask_ollama("refine-query", prompt)
         json_match = re.search(r'\{[\s\S]*\}', response_text)
 
         result = json.loads(json_match.group(0)) if json_match else previous_query
@@ -305,7 +316,7 @@ def build_source_url(site_key: str, query: str) -> str:
     print(f"Generated URL: {url}")
     return url
 
-def generate_paginated_urls(base_url: str, site_key: str, pages: int = 5) -> List[str]:
+def generate_paginated_urls(base_url: str, site_key: str, pages: int = 2) -> List[str]:
     urls = [base_url]
 
     for i in range(2, pages + 1):
@@ -340,7 +351,7 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
         return []
     
     source_url = build_source_url(site_key, query)
-    paginated_urls = generate_paginated_urls(source_url, site_key, pages=3)  # Reduced pages for testing
+    paginated_urls = generate_paginated_urls(source_url, site_key, pages=2)
     
     browser_conf = BrowserConfig(
         headless=False,
@@ -348,16 +359,16 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
     )
     
     run_conf = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS,
+        cache_mode=CacheMode.READ_ONLY,
         wait_for_images=True,
         magic=True,
         simulate_user=True,
         override_navigator=True,
         scan_full_page=True,
-        delay_before_return_html=7,
+        delay_before_return_html=4,
         js_code=[
             "window.scrollTo(0, document.body.scrollHeight/2);",
-            "await new Promise(resolve => setTimeout(resolve, 3000));"
+            "await new Promise(resolve => setTimeout(resolve, 2000));"
         ]
     )
 
@@ -395,7 +406,7 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
                         continue
 
                     # Extract detailed info using LLM for each block
-                    detailed_products = extract_detailed_product_info(product_blocks, keywords)
+                    detailed_products = await extract_detailed_product_info(product_blocks, keywords)
                     page_products = []
                     for product in detailed_products:
                         print(f"DEBUG: Extracted product: {product}")
@@ -455,7 +466,7 @@ async def url_scraper(url: str, min_price: int = 0, max_price: int = 999999) -> 
             product_blocks = split_markdown_to_product_blocks(result.markdown)
             
             # Extract detailed info using LLM for each block
-            detailed_products = extract_detailed_product_info(product_blocks)
+            detailed_products = await extract_detailed_product_info(product_blocks)
             products = []
             for product in detailed_products:
                 if product and product.get('title') and product.get('price') is not None:
@@ -488,9 +499,10 @@ def split_markdown_to_product_blocks(markdown: str, query_keywords: list = None)
         print(f"Debug info saved to product_blocks.md, length = {len(debug_content)}")
     
     filtered_blocks = []
+    noise_patterns = ['Skip to', 'Filters', 'Sort by', 'Results for', 'Sponsored']
     for b in blocks:
-        b.strip()
-        if len(b) > 50 and ('₹' in b or all(kw.lower() in b.lower() for kw in query_keywords)):
+        b = b.strip()
+        if len(b) > 50 and ('₹' in b or any(kw.lower() in b.lower() for kw in query_keywords) and not any(noise in b for noise in noise_patterns)):
             filtered_blocks.append(b)
 
     print(f"Total raw blocks: {len(blocks)}")
@@ -527,7 +539,12 @@ def display_results(products: List[Dict]) -> None:
 
     for i, item in enumerate(products, 1):
         print(f"\n{i}. 🛒 {item.get('title', 'No title')}")
-        print(f"   💰 Price: ₹{item.get('price'):,}" if item.get('price') else "   💰 Price: Not available")
+        price = item.get('price')
+        if price is not None and isinstance(price, (int, float)):
+            print(f"   💰 Price: ₹{price:,}")
+        else:
+            print("   💰 Price: Not available")
+        
         print(f"   ⭐ Rating: {item.get('rating', 'N/A')}")
         print(f"   🏷️ Tags: {', '.join(item.get('tags') or [])}")
         print(f"   🎁 Offers: {item.get('offers', 'N/A')}")
@@ -566,7 +583,7 @@ def save_to_excel(products: List[Dict], filename: str = "scraped_products.xlsx")
     except Exception as e:
         print(f"❌ Error saving to Excel: {str(e)}")
 
-def main():
+async def main():
     """Main function with improved error handling"""
     print("🛒 Smart Product Scraper")
     print("=" * 50)
@@ -589,7 +606,7 @@ def main():
                 continue
                 
             print(f"🔍 Scraping: {url}")
-            products = asyncio.run(url_scraper(url))
+            products = await url_scraper(url)
             
             if products:
                 save_option = input("\n💾 Save results to CSV? (y/n): ").strip().lower()
@@ -603,7 +620,7 @@ def main():
                 continue
 
             print("🤖 Processing your request...")
-            structured = query_llama(user_prompt)
+            structured = await query_llama(user_prompt)
             
             if not structured:
                 print("❌ Could not parse your query. Please try again.")
@@ -611,14 +628,14 @@ def main():
 
             print("✅ Query parsed successfully!")
             
-            questions = ask_follow_up_questions(user_prompt, structured)
+            questions = await ask_follow_up_questions(user_prompt, structured)
             if questions:
                 print("\n🤖 I have a few questions to refine your search:")
                 user_answers = []
                 for q in questions:
                     ans = input(f"→ {q} ").strip()
                     user_answers.append(ans)
-                structured = refine_structured_query_with_answers(user_prompt, user_answers, structured)
+                structured = await refine_structured_query_with_answers(user_prompt, user_answers, structured)
                 print("✅ Query refined with your answers!")
 
             structured["query"] = sanitize_query(structured.get("query", user_prompt))
@@ -627,7 +644,7 @@ def main():
             print(json.dumps(structured, indent=2))
 
             print("\n🚀 Starting scraping process...")
-            results = asyncio.run(run_crawl4ai_scraper(structured))
+            results = await run_crawl4ai_scraper(structured)
             
             if not results:
                 print("\n⚠️ No products found matching your criteria.")
@@ -646,4 +663,4 @@ def main():
             print("❌ Invalid option. Please choose 1 or 2.")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
