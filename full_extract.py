@@ -55,7 +55,7 @@ def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dic
         prompt = f"""
         Ignore navigation, headers or non-product text. Extract only product details from these blocks as a JSON array of objects. Each object should have:
         - "title": string (e.g., full product name)
-        - "price": number (e.g., main price in INR, without currency symbol)
+        - "price": number (e.g., main price in INR, without currency symbol; extract the primary price, ignore discounts; use null if unavailable)
         - "rating": string (e.g., "4.5 out of 5" or "4.5 stars"; use null if unavailable)
         - "tags": array of strings (keywords like ["electronics", "smartphone"]; empty array [] if none)
         - "offers": string (e.g., "Buy 1 Get 1 Free", "Save extra with No Cost EMI"; use null if unavailable)
@@ -66,8 +66,8 @@ def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dic
         Rules:
         - Process each block independently. If a block has multiple products, create separate objects.
         - If no valid products are found in the entire input, return an empty array [].
-        - Ignore irrelevant content like ads or navigation.
-        - DO NOT compare products, analyze, or add any text—extract ONLY the fields above.
+        - Ignore irrelevant content like ads or navigation. DO NOT explain or analyze-extract ONLY the fields.
+        - For price: Take the main listed price (e.g., ₹89,900 → 89900); ignore crossed-out or discount prices.
         - Output ONLY a valid JSON array like [{...}, {...}]. No code blocks, explanations, or extra text. If you start comparing, stop and return [].
 
         Blocks:
@@ -89,7 +89,7 @@ def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dic
                     print(f"No valid JSON from LLM for chunk: {idx}-falling back to regex")
 
                     for block in chunk:
-                        title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', chunk)
+                        title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', block)
                         price_match = re.search(r'₹([\d,]+)', block)
                         rating_match = re.search(r'(\d\.\d) out of 5', block)
                         offers_match = re.search(r'(Save extra with .+)', block)
@@ -380,6 +380,7 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
                         f.write(result.markdown or '')
 
                     keywords = structured.get('query', '').lower().split()
+                    print(f"DEBUG: Using keywords for filtering: {keywords}")
                     product_blocks = split_markdown_to_product_blocks(result.markdown, keywords)
 
                     if product_blocks:
@@ -397,13 +398,16 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
                     detailed_products = extract_detailed_product_info(product_blocks, keywords)
                     page_products = []
                     for product in detailed_products:
-                        print(f"DEBUG: Extracted product: {product}")  # Print every candidate for debug!
-                        if product and product.get('title') and product.get('price') is not None and any(kw.lower() in product['title'].lower() for kw in keywords):
-                            price = product['price']
-                            min_price = structured.get('min_price', 0)
-                            max_price = structured.get('max_price', 999999)
-                            if min_price <= price <= max_price:
-                                page_products.append(product)
+                        print(f"DEBUG: Extracted product: {product}")
+                        if product and product.get('title') and product.get('price') is not None:
+                            title_lower = product['title'].lower()
+                            if any(kw in title_lower for kw in keywords):
+                                price = product['price']
+                                min_price = structured.get('min_price', 0)
+                                max_price = structured.get('max_price', 999999)
+                                if min_price <= price <= max_price:
+                                    page_products.append(product)
+                                    print(f"DEBUG: Added product (passed filter): {product['title']}")
 
                     all_products.extend(page_products)
                     print(f"✅ Found {len(page_products)} products on page {i}")
