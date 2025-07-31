@@ -32,126 +32,34 @@ async def ask_ollama (model: str, prompt: str, stream=False) -> str:
             "temperature": 0
         }
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload, timeout=120) as response:
-            response.raise_for_status()
-            if stream:
-                output = ""
-                async for line in response.content.iter_any():
-                    if line:
-                        chunk = json.loads(line.decode("utf-8"))
-                        output += chunk.get("response", "")
-                return output
-            else:
-                data = await response.json()
-                return data.get("response", "")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=120) as response:
+                response.raise_for_status()
+                if stream:
+                    output = ""
+                    async for line in response.content.iter_any():
+                        if line:
+                            chunk = json.loads(line.decode("utf-8"))
+                            output += chunk.get("response", "")
+                    return output
+                else:
+                    data = await response.json()
+                    return data.get("response", "")
+    except Exception as e:
+        print(f"Error calling Ollama for model {model}: {str(e)}")
+        return ""
 
 async def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dict]:
-    extracted = []
-    chunks = dynamic_chunk(blocks, max_chars=10000)
-
-    async def process_chunk(idx, chunk):
-        joined = "\n\n---\n\n".join(chunk)
-        print(f"\nSending chunk {idx} to LLM, length = {len(joined)} \nchars: {joined[:200]}...")
-        prompt = f"""
-        You are a strict JSON extraction bot. Output ONLY a pure JSON array of product objects. No explanations, no text, no code-blocks only valid JSON.
-        If no products are found or input is invalid, output [] (empty array).
-        For each product, extract exactly:
-        - "title": string (e.g., full product name)
-        - "price": number (e.g., main price in INR, without currency symbol; extract the primary price, ignore discounts; use null if unavailable)
-        - "rating": string (e.g., "4.5 out of 5" or "4.5 stars"; use null if unavailable)
-        - "tags": array of strings (keywords like ["electronics", "smartphone"]; empty array [] if none)
-        - "offers": string (e.g., "Buy 1 Get 1 Free", "Save extra with No Cost EMI"; use null if unavailable)
-        - "discounts": string (e.g., "20% off"; use null if unavailable)
-        - "quantity": string (e.g., "In stock" or "5 left"; use null if unavailable)
-        - "category_properties": object (key-value pairs for specs, e.g., {{"color": "black", "storage": "128GB"}}; empty object {{}} if none)
-
-        Rules:
-        - Process each block independently. If a block has multiple products, create separate objects.
-        - If no valid products are found in the entire input, return an empty array [].
-        - Ignore irrelevant content like ads or navigation. DO NOT explain or analyze-extract ONLY the fields.
-        - For price: Take the main listed price (e.g., ₹89,900 → 89900); ignore crossed-out or discount prices.
-        - Output ONLY a valid JSON array like [{...}, {...}]. No code blocks, explanations, or extra text. If you start comparing, stop and return [].
-
-        Ignore ads, navigation, non-product text, sponsors text. Process independently per block.
-        Example output: [{"title": "iPhone 16", "price": 89900, "rating": "4.5 out of 5", "tags": ["smartphone"], "offers": null, "discounts": null, "quantity": "In stock", "category_properties": {{"storage": "256 GB"}}}]
-
-        Blocks:
-        {joined}
-        """
-        batch = []
-        try:
-            response_text = await ask_ollama("extract-details", prompt)
-            print(f"\nDEBUG: LLM response for chunk {idx}: {response_text[:200]}...")
-            response_text = response_text.strip()
-            json_match = re.search(r'\[\s*\{[\s\S]*?\}\s*]', response_text, re.DOTALL)
-            if json_match:
-                batch_data = json.loads(json_match.group(0))
-                batch.extend(batch_data)
-            else:
-                print(f"No valid JSON from LLM for chunk: {idx}-falling back to regex")
-
-                for block in chunk:
-                    title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', block)
-                    price_match = re.search(r'₹([\d,]+)', block)
-                    rating_match = re.search(r'(\d\.\d) out of 5', block)
-                    offers_match = re.search(r'(Save extra with .+)', block)
-                    discount_match = re.search(r'(\d+% off)', block)
-
-                    if title_match and price_match:
-                        title = title_match.group(1).strip()
-                        if any(kw.lower() in title.lower() for kw in keywords):
-                            entry = {
-                                "title": title,
-                                "price": int(price_match.group(1).replace(",", "")),
-                                "rating": rating_match.group(1) if rating_match else None,
-                                "offers": offers_match.group(1) if offers_match else None,
-                                "discounts": discount_match.group(1) if discount_match else None,
-                                "tags": [],
-                                "quantity": None,
-                                "category_properties": {}
-                            }
-                            batch.append(entry)
-                            print(f"DEBUG: Regex extracted: {entry}")
-        except Exception as e:
-            print(f"LLM error for chunk {idx}: {e}-skipping to fallback")
-            for block in chunk:
-                title_match = re.search(r'## \[([^\]]+)\]', block) or re.search(r'##\s*(.+)', block)
-                price_match = re.search(r'₹([\d,]+)', block)
-                rating_match = re.search(r'(\d\.\d) out of 5', block)
-                offers_match = re.search(r'(Save extra with .+)', block)
-                discount_match = re.search(r'(\d+% off)', block)
-
-                if title_match and price_match:
-                    title = title_match.group(1).strip()
-                    if any(kw.lower() in title.lower() for kw in keywords):
-                        entry = {
-                            "title": title,
-                            "price": int(price_match.group(1).replace(",", "")),
-                            "rating": rating_match.group(1) if rating_match else None,
-                            "offers": offers_match.group(1) if offers_match else None,
-                            "discounts": discount_match.group(1) if discount_match else None,
-                            "tags": [],
-                            "quantity": None,
-                            "category_properties": {}
-                        }
-                        batch.append(entry)
-                        print(f"DEBUG: Regex extracted: {entry}")
-            return batch
-            
-    tasks = [process_chunk(idx, chunk) for idx, chunk in enumerate(chunks, 1)]
-    results = await asyncio.gather(*tasks)
-    for batch in results:
-        extracted.extend(batch)
-    print(f"DEBUG: Total extracted products: {len(extracted)}")
-    seen = set()
-    unique_extracted = []
-    for prod in extracted:
-        if (prod['title'], prod.get('price')) not in seen:
-            seen.add(prod['title'])
-            unique_extracted.append(prod)
-    print(f"\nDEBUG: Total unique extracted products: {len(unique_extracted)}")
-    return unique_extracted
+    """Regex-based product extraction - fast and reliable"""
+    markdown = "\n\n".join(blocks)
+    products = extract_products_from_markdown(markdown, keywords)
+    
+    print(f"DEBUG: Regex extracted {len(products)} products")
+    for product in products:
+        print(f"DEBUG: {product['title']} - ₹{product['price']:,}")
+    
+    return products
 
 def dynamic_chunk(blocks, max_chars = 8000):
     chunks = []
@@ -409,7 +317,7 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
                     detailed_products = await extract_detailed_product_info(product_blocks, keywords)
                     page_products = []
                     for product in detailed_products:
-                        print(f"DEBUG: Extracted product: {product}")
+                        print(f"DEBUG: Extracted product: {json.dumps(product)}")
                         if product and product.get('title') and product.get('price') is not None:
                             title_lower = product['title'].lower()
                             if any(kw in title_lower for kw in keywords):
@@ -418,7 +326,7 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
                                 max_price = structured.get('max_price', 999999)
                                 if min_price <= price <= max_price:
                                     page_products.append(product)
-                                    print(f"DEBUG: Added product (passed filter): {product['title']}")
+                                    print(f"DEBUG: Added product (passed filter): {json.dumps({'title': product['title']})}")
 
                     all_products.extend(page_products)
                     print(f"✅ Found {len(page_products)} products on page {i}")
@@ -492,26 +400,292 @@ def split_markdown_to_product_blocks(markdown: str, query_keywords: list = None)
     if query_keywords is None:
         query_keywords = []
     
-    blocks = re.split(r'(?:\n\s*\n+|^#+\s|\n#+\s|\[!\[|\nPrice,\sproduct\spage)', markdown, flags=re.IGNORECASE)
-    debug_content = "\n---\n".join(blocks)
-    with open("product_blocks.md", "w", encoding="utf-8") as f:
-        f.write(debug_content)
-        print(f"Debug info saved to product_blocks.md, length = {len(debug_content)}")
-    
-    filtered_blocks = []
-    noise_patterns = ['Skip to', 'Filters', 'Sort by', 'Results for', 'Sponsored']
-    for b in blocks:
-        b = b.strip()
-        if len(b) > 50 and ('₹' in b or any(kw.lower() in b.lower() for kw in query_keywords) and not any(noise in b for noise in noise_patterns)):
-            filtered_blocks.append(b)
+    blocks = re.split(r'(?:\n\s*\n+|^#+\s|\n#+\s|^---+|^\*\*\*+)', markdown, flags=re.MULTILINE)
 
+    filtered_blocks = []
+    noise_patterns = [
+        r'skip to', r'keyboard shortcuts', r'your lists', r'your account',
+        r'select.*department', r'all categories', r'sort by', r'filter',
+        r'results? for', r'sponsored', r'advertisement', r'cookies',
+        r'privacy policy', r'terms of service', r'copyright', r'©.*\d{4}',
+        r'update location', r'delivering to', r'change address'
+    ]
+
+    for block in blocks:
+        block = block.strip()
+        if len(block) < 30:
+            continue
+
+        is_noise = any(re.search(pattern, block, re.IGNORECASE) for pattern in noise_patterns)
+        if is_noise:
+            continue
+
+        has_price = bool(re.search(r'[₹$]\s*[\d,]+', block))
+        has_product_words = bool(re.search(r'\b(?:buy|price|offer|discount|sale|deal|product|item|model|brand|available|stock|delivery|shipping)\b', block, re.IGNORECASE))
+
+        if has_price or has_product_words:
+            filtered_blocks.append(block)
+    
     print(f"Total raw blocks: {len(blocks)}")
     print(f"Total filtered blocks: {len(filtered_blocks)}")
-    if filtered_blocks:
-        print(f"Sample filtered block: {filtered_blocks[0][:500]}...")
-    else:
-        print("WARNING: No blocks passed filters-check regex or input markdown")
     return filtered_blocks
+
+def extract_products_from_markdown (markdown: str, keywords: list = None, min_price: int = 0, max_price: int = 99999) -> List[Dict]:
+    """Enhanced regex-based product extraction"""
+    products = []
+
+    blocks = re.split(r'\n\s*\n+', markdown)
+
+    for block in blocks:
+        if len(block) < 50 or '₹' not in block:
+            continue
+
+        product = extract_product_from_block(block, keywords)
+        if product and min_price <= product.get('price', 0) <= max_price:
+            products.append(product)
+    
+    unique_products = []
+    seen = set()
+    for product in products:
+        key = (product['title'], product['price'])
+        if key not in seen:
+            seen.add(key)
+            unique_products.append(product)
+    
+    return unique_products
+
+def extract_product_from_block(block: str, keywords: list = None) -> Dict:
+    """Generic product extraction that works for any product type"""
+    if keywords is None:
+        keywords = []
+    
+    # Skip obvious navigation/system blocks
+    skip_patterns = [
+        r'Select the department',
+        r'Skip to.*content',
+        r'Your Lists.*Your Account',
+        r'Sort by:',
+        r'Results for.*in',
+        r'Sponsored.*Let us know',
+        r'Price range.*Go',
+        r'^All\s+Categories',
+        r'Update location'
+    ]
+    
+    for pattern in skip_patterns:
+        if re.search(pattern, block, re.IGNORECASE | re.DOTALL):
+            return None
+    
+    # 1. UNIVERSAL PRICE EXTRACTION
+    price_patterns = [
+        r'₹\s*([\d,]+)',                    # ₹1,23,456
+        r'Rs\.?\s*([\d,]+)',                # Rs. 1,23,456
+        r'INR\s*([\d,]+)',                  # INR 123456
+        r'\$\s*([\d,]+)',                   # $1,234
+        r'Price:?\s*[₹$]\s*([\d,]+)',       # Price: ₹1,234
+    ]
+    
+    prices = []
+    for pattern in price_patterns:
+        matches = re.findall(pattern, block, re.IGNORECASE)
+        for match in matches:
+            try:
+                price_val = int(match.replace(',', ''))
+                if price_val > 10:  # Filter out obviously wrong prices
+                    prices.append(price_val)
+            except ValueError:
+                continue
+    
+    if not prices:
+        return None
+    
+    # Use the most reasonable price (not too low, not extremely high)
+    main_price = max(p for p in prices if 10 <= p <= 10000000)  # Between ₹10 and ₹1 crore
+    
+    # 2. UNIVERSAL TITLE EXTRACTION
+    title_patterns = [
+        # Markdown/HTML headings
+        r'##\s*\[([^\]]{15,120})\]',                    # ## [Product Title](link)
+        r'##\s+([^\n]{15,120})',                        # ## Product Title
+        r'###\s*([^\n]{15,120})',                       # ### Product Title
+        
+        # Bold/emphasized text (common for product names)
+        r'\*\*([^\*\n]{15,120})\*\*',                   # **Product Title**
+        r'__([^_\n]{15,120})__',                        # __Product Title__
+        
+        # Numbered/bulleted lists
+        r'^\d+\.\s+([^\n]{15,120})',                    # 1. Product Title
+        r'^\*\s+([^\n]{15,120})',                       # * Product Title
+        r'^\-\s+([^\n]{15,120})',                       # - Product Title
+        
+        # Lines that look like product titles (start with capital, reasonable length)
+        r'^([A-Z][^\n₹\[\]]{15,120})(?=.*₹)',          # Capitalized line with price nearby
+        r'([A-Z][^\n₹\[\]]{15,120})\s*₹',              # Title directly before price
+        
+        # Link text (often contains product names)
+        r'\[([^\]]{15,120})\]\(https?://[^\)]+\)',      # [Product Title](https://...)
+        
+        # Text near prices (common pattern)
+        r'([A-Z][^₹\n\[\]]{15,120})\s*[₹$]\s*[\d,]+',   # "Product Name ₹1,234"
+        r'[₹$]\s*[\d,]+\s*([A-Z][^₹\n\[\]]{15,120})',   # "₹1,234 Product Name"
+        
+        # Sentences that look like product descriptions
+        r'([A-Z][^.\n]{20,120}(?:with|featuring|equipped|includes)[^.\n]{5,50})', # Descriptive titles
+    ]
+    
+    title = None
+    best_score = 0
+    
+    for pattern in title_patterns:
+        matches = re.findall(pattern, block, re.MULTILINE | re.IGNORECASE)
+        for match in matches:
+            candidate = match.strip()
+            
+            # Clean up candidate
+            candidate = re.sub(r'^\W+|\W+$', '', candidate)
+            candidate = re.sub(r'\s+', ' ', candidate)
+            candidate = re.sub(r'\([^)]*\)', '', candidate)  # Remove parentheses
+            
+            # Score the candidate based on how "product-like" it is
+            score = 0
+            
+            # Length bonus (not too short, not too long)
+            if 20 <= len(candidate) <= 100:
+                score += 2
+            
+            # Keyword bonus (if keywords provided)
+            if keywords:
+                keyword_matches = sum(1 for kw in keywords if kw.lower() in candidate.lower())
+                score += keyword_matches * 3
+            else:
+                score += 1  # Default bonus if no keywords
+            
+            # Common product indicators
+            product_indicators = [
+                'pro', 'plus', 'max', 'mini', 'air', 'ultra', 'premium', 'standard',
+                'gb', 'tb', 'inch', 'core', 'gen', 'edition', 'model', 'series',
+                'laptop', 'phone', 'tablet', 'watch', 'speaker', 'camera',
+                'wireless', 'bluetooth', 'smart', 'digital', 'portable'
+            ]
+            indicator_bonus = sum(1 for indicator in product_indicators if indicator in candidate.lower())
+            score += indicator_bonus
+            
+            # Penalize navigation/generic text
+            bad_indicators = [
+                'select', 'department', 'category', 'filter', 'sort', 'results',
+                'your lists', 'account', 'cart', 'checkout', 'sign in'
+            ]
+            penalty = sum(2 for bad in bad_indicators if bad in candidate.lower())
+            score -= penalty
+            
+            # Choose the best title
+            if score > best_score and score > 0:
+                best_score = score
+                title = candidate[:100]  # Limit length
+    
+    if not title:
+        return None
+    
+    # 3. Build the product object
+    product = {
+        "title": title,
+        "price": main_price,
+        "rating": extract_rating(block),
+        "discount": extract_discount(block),
+        "offers": extract_offers(block),
+        "link": extract_link(block),
+        "image": extract_image(block),
+        "availability": extract_availability(block)
+    }
+    
+    return product
+
+def extract_rating(block: str) -> str:
+    """Extract product rating"""
+    rating_patterns = [
+         r'(\d+\.?\d*)\s*out\s*of\s*\d+',      # 4.5 out of 5
+        r'(\d+\.?\d*)\s*stars?',               # 4.5 stars
+        r'(\d+\.?\d*)\s*/\s*\d+',             # 4.5/5
+        r'Rating:?\s*(\d+\.?\d*)',             # Rating: 4.5
+        r'⭐+\s*(\d+\.?\d*)',                   # ⭐⭐⭐⭐⭐ 4.5
+        r'(\d+\.?\d*)\s*⭐',                    # 4.5 ⭐
+    ]
+    
+    for pattern in rating_patterns:
+        match = re.search(pattern, block, re.IGNORECASE)
+        if match:
+            rating_val = float(match.group(1))
+            if 0 <= rating_val <= 5:
+                return f"{rating_val} stars"
+    return None
+
+def extract_discount(block: str) -> str:
+    """Extract discount information"""
+    discount_patterns = [
+        r'(\d+%\s*off)',                       # 20% off
+        r'Save\s*[₹$]\s*([\d,]+)',            # Save ₹5000
+        r'(\d+%\s*discount)',                  # 20% discount
+        r'Was\s*[₹$]([\d,]+)',                # Was ₹10000 (implies discount)
+        r'M\.R\.P:?\s*[₹$]([\d,]+)',          # M.R.P: ₹10000
+        r'List\s*Price:?\s*[₹$]([\d,]+)',     # List Price: $100
+    ]
+    
+    for pattern in discount_patterns:
+        match = re.search(pattern, block, re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+    return None
+
+def extract_offers(block: str) -> str:
+    """Extract special offers"""
+    offer_patterns = [
+        r'(Buy\s+\d+\s+Get\s+\d+[^.\n]*)',          # Buy 1 Get 1
+        r'(Free\s+[^.\n]{5,30})',                   # Free shipping, Free delivery
+        r'(No\s+Cost\s+EMI[^.\n]*)',                # No Cost EMI
+        r'(Express\s+delivery[^.\n]*)',             # Express delivery
+        r'(Same\s+day\s+delivery[^.\n]*)',          # Same day delivery
+        r'(Prime\s+eligible[^.\n]*)',               # Prime eligible
+        r'(Limited\s+time\s+offer[^.\n]*)',         # Limited time offer
+        r'(Special\s+price[^.\n]*)',                # Special price
+    ]
+    
+    offers = []
+    for pattern in offer_patterns:
+        matches = re.findall(pattern, block, re.IGNORECASE)
+        offers.extend([match.strip() for match in matches])
+    
+    return '; '.join(offers[:3]) if offers else None
+
+def extract_link(block: str) -> str:
+    """Extract product link"""
+    link_pattern = r'\[([^\]]*)\]\((https?://[^\)]+)\)'
+    match = re.search(link_pattern, block)
+    return match.group(2) if match else None
+
+def extract_image(block: str) -> str:
+    """Extract product image"""
+    image_pattern = r'!\[([^\]]*)\]\((https?://[^\)]+)\)'
+    match = re.search(image_pattern, block)
+    return match.group(2) if match else None
+
+def extract_availability(block: str) -> str:
+    """Extract availability status"""
+    availability_patterns = [
+        r'(In\s+stock)',
+        r'(Out\s+of\s+stock)',
+        r'(\d+\s+left\s+in\s+stock)',
+        r'(Currently\s+unavailable)',
+        r'(Available\s+now)',
+        r'(Ships\s+in\s+\d+[^.\n]*)',
+        r'(Delivery\s+by\s+[^.\n]*)',
+        r'(Available\s+for\s+delivery)',
+    ]
+    
+    for pattern in availability_patterns:
+        match = re.search(pattern, block, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return None
 
 def clean_markdown_to_text(markdown: str) -> str:
     """Clean markdown and convert to readable text"""
@@ -533,28 +707,29 @@ def display_results(products: List[Dict]) -> None:
     if not products:
         print("📭 No products to display")
         return
-    
+
     print(f"\n🛍️ Found {len(products)} products:")
     print("=" * 80)
-
+    
     for i, item in enumerate(products, 1):
-        print(f"\n{i}. 🛒 {item.get('title', 'No title')}")
-        price = item.get('price')
-        if price is not None and isinstance(price, (int, float)):
-            print(f"   💰 Price: ₹{price:,}")
-        else:
-            print("   💰 Price: Not available")
+        title = item.get("title", "No title")
+        price = f"₹{item['price']:,}" if item.get("price") else "Price not available"
         
-        print(f"   ⭐ Rating: {item.get('rating', 'N/A')}")
-        print(f"   🏷️ Tags: {', '.join(item.get('tags') or [])}")
-        print(f"   🎁 Offers: {item.get('offers', 'N/A')}")
-        print(f"   🔻 Discounts: {item.get('discounts', 'N/A')}")
-        print(f"   📦 Quantity: {item.get('quantity', 'N/A')}")
-        print(f"   🔖 Category Properties:")
-        for k, v in (item.get('category_properties') or {}).items():
-            print(f"      - {k}: {v}")
+        print(f"\n{i}. 🛒 {title}")
+        print(f"   💰 Price: {price}")
+        
+        if item.get("rating"):
+            print(f"   ⭐ Rating: {item['rating']}")
+        if item.get("discount"):
+            print(f"   🏷️ Discount: {item['discount']}")
+        if item.get("offers"):
+            print(f"   🎁 Offers: {item['offers']}")
+        if item.get("availability"):
+            print(f"   📦 Availability: {item['availability']}")
+        if item.get("link"):
+            print(f"   🔗 Link: {item['link']}")
+        
         print("-" * 80)
-
 def save_to_dataframe(products: List[Dict], filename: str = "scraped_products.csv") -> None:
     """Save products to a CSV file using pandas"""
     if not products:
@@ -562,6 +737,8 @@ def save_to_dataframe(products: List[Dict], filename: str = "scraped_products.cs
         return
         
     try:
+        if ".csv" not in filename:
+            filename = filename+".csv"
         df = pd.DataFrame(products)
         df.to_csv(filename, index=False)
         print(f"💾 Results saved to {filename}")
