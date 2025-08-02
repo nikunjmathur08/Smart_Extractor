@@ -9,6 +9,7 @@ import pandas as pd
 import requests
 from more_itertools import chunked
 import aiohttp
+from concurrent.futures import ThreadPoolExecutor
 
 SITE_URL_BUILDERS = {
     "amazon": lambda query: f"https://www.amazon.in/s?k={urllib.parse.quote_plus(query)}",
@@ -65,14 +66,23 @@ async def extract_detailed_product_info(blocks: List[str], keywords: list) -> Li
         chunks = dynamic_chunk(blocks, max_chars=6000)
         print(f"\nDEBUG: Created {len(chunks)} chunks using dynamic_chunk()")
 
+        tasks = []
+        for i, chunk in enumerate(chunks, 1):
+            print(f"\nDEBUG: Queuing chunk {i}/{len(chunks)} with {len(chunk)} blocks")
+            task = extract_with_llm(chunk, keywords)
+            tasks.append(task)
+        
+        chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+
         all_llm_products = []
 
-        for i, chunk in enumerate(chunks, 1):
-            print(f"\nDEBUG: Processing chunk {i}/{len(chunks)} with {len(chunk)} blocks")
-            chunk_products = await extract_with_llm(chunk, keywords)
-            if chunk_products:
-                all_llm_products.extend(chunk_products)
-                print(f"\nDEBUG: Chunk {i} yielded {len(chunk_products)} products")
+        for i, result in enumerate(chunk_results, 1):
+            if isinstance(result, Exception):
+                print(f"\nDEBUG: Chunk {i} failed: {str(result)}")
+                continue
+            if result:
+                all_llm_products.extend(result)
+                print(f"\nDEBUG: Chunk {i} yielded {len(result)} products")
         
         if all_llm_products:
             print("\n DEBUG: LLM extraction successful!")
@@ -357,67 +367,75 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
         ]
     )
 
-    all_products = []
+    async def scrape_single_page(crawler, url, page_num):
+        """Scrape single page asynchronously"""
+        try:
+            print(f"Scraping page {page_num}: {url}")
+            result = await crawler.arun(url=url, config=run_conf)
+
+            if not result or not result.success:
+                print(f"Failed to scrape page {page_num}")
+                return []
+            
+            asyncio.create_task(write_debug_file(f"debug_page_{page_num}.md", result.markdown))
+
+            keywords = structured.get('query', '').lower().split()
+            product_blocks = split_markdown_to_product_blocks(result.markdown, keywords)
+
+            if not product_blocks:
+                print(f"No product blocks found from page {page_num}")
+                return []
+            
+            asyncio.create_task(write_debug_file(f"product_block_{page_num}.md", "\n\n---\n\n".join(product_blocks)))
+
+            detailed_products = await extract_detailed_product_info(product_blocks, keywords)
+
+            page_products = []
+            for product in detailed_products:
+                if product and product.get('title') and product.get('price') is not None:
+                    title_lower = product['title'].lower()
+                    if any(kw in title_lower for kw in keywords):
+                        price = product['price']
+                        min_price = structured.get('min_price', 0)
+                        max_price = structured.get('max_price', 999999)
+                        if min_price <= price <= max_price:
+                            page_products.append(product)
+            print(f"✅ Found {len(page_products)} products on page {page_num}")
+            return page_products
+        except Exception as e:
+            print(f"Error scraping page {page_num}: {e}")
+            return []
 
     try:
         async with AsyncWebCrawler(config=browser_conf) as crawler:
+            tasks = []
             for i, url in enumerate(paginated_urls, start=1):
-                try:
-                    print(f"🔍 Scraping page {i}: {url}")
-                    result = await crawler.arun(url=url, config=run_conf)
+                task = scrape_single_page(crawler, url, i)
+                tasks.append(task)
+            
+            page_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                    if not result or not result.success:
-                        print(f"❌ Failed to scrape page {i}: {getattr(result, 'error_message', 'No result')}")
-                        continue
-
-                    # Save the raw markdown for debug purposes, but DO NOT break!
-                    print("Saving data to markdown file...")
-                    with open(f"debug_page_{i}.md", "w", encoding="utf-8") as f:
-                        f.write(result.markdown or '')
-
-                    keywords = structured.get('query', '').lower().split()
-                    print(f"DEBUG: Using keywords for filtering: {keywords}")
-                    product_blocks = split_markdown_to_product_blocks(result.markdown, keywords)
-
-                    if product_blocks:
-                        with open(f"product_block_{i}.md", "w", encoding="utf-8") as p:
-                            p.write("\n---\n".join(product_blocks))
-                        print(f"Saved {len(product_blocks)} blocks to product_block_{i}.md")
-
-                    else:
-                        print(f"DEBUG: No blocks saved for page {i}")
-                    if not product_blocks:
-                        print(f"No product blocks found from page {i} (markdown length: {len(result.markdown)})")
-                        continue
-
-                    # Extract detailed info using LLM for each block
-                    detailed_products = await extract_detailed_product_info(product_blocks, keywords)
-                    page_products = []
-                    for product in detailed_products:
-                        print(f"DEBUG: Extracted product: {json.dumps(product)}")
-                        if product and product.get('title') and product.get('price') is not None:
-                            title_lower = product['title'].lower()
-                            if any(kw in title_lower for kw in keywords):
-                                price = product['price']
-                                min_price = structured.get('min_price', 0)
-                                max_price = structured.get('max_price', 999999)
-                                if min_price <= price <= max_price:
-                                    page_products.append(product)
-                                    print(f"DEBUG: Added product (passed filter): {json.dumps({'title': product['title']})}")
-
-                    all_products.extend(page_products)
-                    print(f"✅ Found {len(page_products)} products on page {i}")
-
-                    await asyncio.sleep(2)
-
-                except Exception as e:
-                    print(f"Error scraping using run_crawl4ai_scraper: {e}")
-
-            print(f"🎉 Total products found: {len(all_products)}")
+            all_products = []
+            for i, result in enumerate(page_results, 1):
+                if isinstance(result, Exception):
+                    print(f"Page {i} failed: {result}")
+                    continue
+                if result:
+                    all_products.extend(result)
+            
+            print(f"Total products found: {len(all_products)}")
             return all_products
     except Exception as e:
         print(f"⚠️ Scraping error: {str(e)}")
         return []
+
+async def write_debug_file(filename: str, content: str):
+    """Async file writing to avoid blocking"""
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content or '')
+    except Exception as e:
+        print(f"\nDEBUG: Failed to write {filename}: {e}")
 
 async def url_scraper(url: str, min_price: int = 0, max_price: int = 999999) -> List[Dict]:
     """Scrape a single URL"""
@@ -798,7 +816,7 @@ def display_results(products: List[Dict]) -> None:
         if item.get("rating"):
             print(f"   ⭐ Rating: {item['rating']}")
         if item.get("discount"):
-            print(f"   🏷️ Discount: {item['discount']}")
+            print(f"   🏷️  Discount: {item['discount']}")
         if item.get("offers"):
             print(f"   🎁 Offers: {item['offers']}")
         if item.get("availability"):
