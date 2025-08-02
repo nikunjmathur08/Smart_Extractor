@@ -32,9 +32,11 @@ async def ask_ollama (model: str, prompt: str, stream=False) -> str:
             "temperature": 0
         }
     }
+    print(f"\nDEBUG: Calling model '{model}' with prompt length: {len(prompt)}")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload, timeout=120) as response:
+                print(f"\nDEBUG: HTTP status: {response.status}")
                 response.raise_for_status()
                 if stream:
                     output = ""
@@ -42,24 +44,99 @@ async def ask_ollama (model: str, prompt: str, stream=False) -> str:
                         if line:
                             chunk = json.loads(line.decode("utf-8"))
                             output += chunk.get("response", "")
+                    print(f"\nDEBUG: Stream response length: {len(output)}")
                     return output
                 else:
                     data = await response.json()
-                    return data.get("response", "")
+                    response_text = data.get('response', '')
+                    print(f"\nDEBUG: Response length: {len(response_text)}")
+                    print(f"\nDEBUG: Response preview: {response_text[:200]}...\n")
+                    return response_text
     except Exception as e:
         print(f"Error calling Ollama for model {model}: {str(e)}")
         return ""
 
 async def extract_detailed_product_info(blocks: List[str], keywords: list) -> List[Dict]:
-    """Regex-based product extraction - fast and reliable"""
-    markdown = "\n\n".join(blocks)
-    products = extract_products_from_markdown(markdown, keywords)
+    """Extract products using LLM and regex as fallback"""
+    try:
+        print("\nDEBUG: Sending data to LLM...")
+        print("\nDEBUG: Please wait...")
+
+        chunks = dynamic_chunk(blocks, max_chars=6000)
+        print(f"\nDEBUG: Created {len(chunks)} chunks using dynamic_chunk()")
+
+        all_llm_products = []
+
+        for i, chunk in enumerate(chunks, 1):
+            print(f"\nDEBUG: Processing chunk {i}/{len(chunks)} with {len(chunk)} blocks")
+            chunk_products = await extract_with_llm(chunk, keywords)
+            if chunk_products:
+                all_llm_products.extend(chunk_products)
+                print(f"\nDEBUG: Chunk {i} yielded {len(chunk_products)} products")
+        
+        if all_llm_products:
+            print("\n DEBUG: LLM extraction successful!")
+            return all_llm_products
+    except Exception as e:
+        print(f"\n DEBUG: LLM extraction failed {str(e)}, using regex instead")
     
-    print(f"DEBUG: Regex extracted {len(products)} products")
-    for product in products:
+    markdown = "\n\n".join(blocks)
+    regex_products = extract_products_from_markdown(markdown, keywords)
+    
+    print(f"DEBUG: Regex extracted {len(regex_products)} products")
+    for product in regex_products:
         print(f"DEBUG: {product['title']} - ₹{product['price']:,}")
     
-    return products
+    return regex_products
+
+async def extract_with_llm(markdown: str, keywords: list) -> List[Dict]:
+    """Try extraction with LLM"""
+    joined = "\n\n---\n\n".join(markdown)
+    prompt = f"""
+    You are a precise product data extraction expert.
+    Carefully analyze the product blocks below separated by '---'.
+    Extract for each product: title, price (numeric), rating, tags (list), offers, discounts, quantity, category_properties.
+    Output ONLY a JSON array of products.
+    Filter products related to keywords: {', '.join(keywords)}.
+
+    Blocks:
+    {joined[:4000]}
+    """
+
+    response = await ask_ollama("extract-details", prompt)
+    if not response.strip():
+        raise ValueError("Empty LLM response")
+    
+    try:
+        json_start = -1
+        for i, char in enumerate(response):
+            if char in '[{':
+                json_start = i
+                break
+        
+        if json_start == -1:
+            raise ValueError("No JSON structure found in response")
+        
+        json_text = response[json_start:].strip()
+
+        data = json.loads(response)
+        if not isinstance(data, list):
+            raise ValueError("Not a JSON array")
+        
+        for product in data:
+            price = product.get('price')
+            if isinstance(price, str):
+                price = re.sub(r'[^\\d]', '', price)
+                try:
+                    product['price'] = int(price)
+                except ValueError:
+                    product['price'] = None
+
+        filtered = [p for p in data if p.get('price') is not None and any(k.lower() in p.get('title', '').lower() for k in keywords)]
+
+        return filtered
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"Invalid LLM response: {str(e)}")
 
 def dynamic_chunk(blocks, max_chars = 8000):
     chunks = []
