@@ -129,20 +129,28 @@ async def extract_with_llm(markdown: str, keywords: list) -> List[Dict]:
         
         json_text = response[json_start:].strip()
 
-        data = json.loads(response)
+        data = json.loads(json_text)
         if not isinstance(data, list):
             raise ValueError("Not a JSON array")
         
         for product in data:
             price = product.get('price')
+            if isinstance(price, (int, float)):
+                product['price'] = int(price)
+                continue
             if isinstance(price, str):
                 price = re.sub(r'[^\\d]', '', price)
                 try:
                     product['price'] = int(price)
                 except ValueError:
                     product['price'] = None
+            else:
+                product['price'] = None
 
-        filtered = [p for p in data if p.get('price') is not None and any(k.lower() in p.get('title', '').lower() for k in keywords)]
+        filtered = [
+            p for p in data
+            if p.get('title') and (not keywords or any(k.lower() in p.get('title', '').lower() for k in keywords))
+        ]
 
         return filtered
     except (json.JSONDecodeError, ValueError) as e:
@@ -153,7 +161,7 @@ def dynamic_chunk(blocks, max_chars = 8000):
     current_chunk = []
     current_len = 0
     for block in blocks:
-        if len(block) < 100 or '₹' not in block:  # Pre-filter: Skip short/no-price blocks to reduce LLM load
+        if not looks_like_product_block(block):
             continue
         block_len = len(block)
         if current_len + block_len + len("\n\n---\n\n") > max_chars:
@@ -167,20 +175,61 @@ def dynamic_chunk(blocks, max_chars = 8000):
         chunks.append(current_chunk)
     return chunks
 
-def cleaned_markdown(markdown: str) -> str:
-    """Removes noise from data scraped without erasing products"""
-    # More targeted removals
-    markdown = re.sub(r'## Skip to.*Keyboard shortcuts.*To move between items.*', '', markdown, flags=re.DOTALL | re.IGNORECASE)  # Remove specific header
-    markdown = re.sub(r'Your Lists.*Your Account.*', '', markdown, flags=re.DOTALL)  # Account section
-    markdown = re.sub(r'Sort by:.*Newest Arrivals.*', '', markdown, flags=re.DOTALL)  # Sort bar
-    markdown = re.sub(r'\[SponsoredSponsored \].*?\[Let us know \].*?', '', markdown, flags=re.DOTALL)  # Sponsored, limited scope
-    markdown = re.sub(r'!\[.*?\]\(.*?\)', '', markdown)  # Images
-    markdown = re.sub(r'\[.*?\]\(.*?\)', lambda m: m.group(1) if 'http' not in m.group(0) else '', markdown)  # Links
-    markdown = re.sub(r'© 1996-2025, Amazon.com.*', '', markdown)  # Footer
+def block_has_price(block: str) -> bool:
+    """Detect common price formats in scraped text."""
+    return bool(re.search(
+        r'(?:₹|Rs\.?|INR|\$)\s*[\d,]+(?:\.\d+)?|(?:price|deal|offer)\s*[:\-]?\s*[\d,]+',
+        block,
+        re.IGNORECASE,
+    ))
 
-    lines = markdown.split('\n')
-    preserved = [line for line in lines if re.search(r'₹[\d,]+|\*\*.*\*\*', line, re.IGNORECASE)]  # Keep relevant
-    return '\n'.join(preserved).strip()
+def looks_like_product_block(block: str, query_keywords: list = None) -> bool:
+    """Allow product-like blocks even when price is missing in markdown."""
+    if query_keywords is None:
+        query_keywords = []
+
+    text = block.strip()
+    if len(text) < 120:
+        return False
+
+    text_lower = text.lower()
+    has_query_keyword = bool(query_keywords and any(kw in text_lower for kw in query_keywords if len(kw) > 2))
+    has_product_words = bool(re.search(
+        r'\b(?:tv|television|inch|cm|uhd|fhd|oled|qled|smart|buy|price|offer|discount|deal|product|model|brand|ratings?|reviews?)\b',
+        text_lower,
+    ))
+    has_product_link = bool(re.search(r'https?://[^\s\)]*(?:/dp/|/gp/aw/d/|/gp/product/|/s\?)', text))
+    has_rating = bool(re.search(r'out of 5 stars|ratings?\b|reviews?\b', text_lower))
+    has_price = block_has_price(text)
+
+    if has_price:
+        return True
+    return (has_product_words or has_query_keyword) and (has_product_link or has_rating or len(text) >= 220)
+
+def cleaned_markdown(markdown: str) -> str:
+    """Removes noise from data scraped without erasing products.
+    Only removes specific known-noise sections. Preserves paragraph/line structure
+    so split_markdown_to_product_blocks can still split on blank lines."""
+    noise_line_patterns = [
+        r'^#*\s*Skip to\b',
+        r'^#*\s*Keyboard shortcuts?\b',
+        r'^\s*To move between items\b',
+        r'^\s*Select the department you want to search in\b',
+        r'^\s*Search Amazon\.in\s*$',
+        r'^\s*(Need help\??|More results?|Show more|See all results?)\s*$',
+        r'^\s*-?\d+\s+of\s+\d+\s+results?\s+for\s+.*$',
+        r'^\s*©\s*1996-\d{4},\s*Amazon\.com.*$',
+    ]
+
+    cleaned_lines = []
+    for line in markdown.splitlines():
+        if any(re.search(pattern, line, re.IGNORECASE) for pattern in noise_line_patterns):
+            continue
+        cleaned_lines.append(line.rstrip())
+
+    cleaned = "\n".join(cleaned_lines)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
 
 def extract_search_terms(structured_query):
     """Extract clean search terms from structured query"""
@@ -379,8 +428,11 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
             
             asyncio.create_task(write_debug_file(f"debug_page_{page_num}.md", result.markdown))
 
+            # Clean the markdown first to remove navigation and noise
+            clean_md = cleaned_markdown(result.markdown)
+            
             keywords = structured.get('query', '').lower().split()
-            product_blocks = split_markdown_to_product_blocks(result.markdown, keywords)
+            product_blocks = split_markdown_to_product_blocks(clean_md, keywords)
 
             if not product_blocks:
                 print(f"No product blocks found from page {page_num}")
@@ -392,15 +444,21 @@ async def run_crawl4ai_scraper(structured: Dict) -> List[Dict]:
 
             page_products = []
             for product in detailed_products:
-                if product and product.get('title') and product.get('price') is not None:
+                if product and product.get('title'):
                     title_lower = product['title'].lower()
                     if any(kw in title_lower for kw in keywords):
-                        price = product['price']
+                        price = product.get('price')
                         min_price = structured.get('min_price', 0)
                         max_price = structured.get('max_price', 999999)
-                        if min_price <= price <= max_price:
+                        if price is None and min_price <= 0:
                             page_products.append(product)
-            print(f"✅ Found {len(page_products)} products on page {page_num}")
+                        elif isinstance(price, (int, float)) and min_price <= price <= max_price:
+                            page_products.append(product)
+            
+            # Apply post-processing filter to remove navigation/UI elements
+            page_products = filter_valid_products(page_products)
+            
+            print(f"✅ Found {len(page_products)} valid products on page {page_num}")
             return page_products
         except Exception as e:
             print(f"Error scraping page {page_num}: {e}")
@@ -469,12 +527,14 @@ async def url_scraper(url: str, min_price: int = 0, max_price: int = 999999) -> 
             product_blocks = split_markdown_to_product_blocks(result.markdown)
             
             # Extract detailed info using LLM for each block
-            detailed_products = await extract_detailed_product_info(product_blocks)
+            detailed_products = await extract_detailed_product_info(product_blocks, [])
             products = []
             for product in detailed_products:
-                if product and product.get('title') and product.get('price') is not None:
-                    price = product['price']
-                    if min_price <= price <= max_price:
+                if product and product.get('title'):
+                    price = product.get('price')
+                    if price is None and min_price <= 0:
+                        products.append(product)
+                    elif isinstance(price, (int, float)) and min_price <= price <= max_price:
                         products.append(product)
 
             if products:
@@ -501,24 +561,36 @@ def split_markdown_to_product_blocks(markdown: str, query_keywords: list = None)
     noise_patterns = [
         r'skip to', r'keyboard shortcuts', r'your lists', r'your account',
         r'select.*department', r'all categories', r'sort by', r'filter',
-        r'results? for', r'sponsored', r'advertisement', r'cookies',
+        r'results? for', r'advertisement', r'cookies',
         r'privacy policy', r'terms of service', r'copyright', r'©.*\d{4}',
-        r'update location', r'delivering to', r'change address'
+        r'update location', r'delivering to', r'change address',
+        r'^\d+\s*of\s*\d+\s*results?', r'^-?\d+\s*of\s*\d+\s*results?',  # "16 of 75 results"
+        r'^more results?$', r'^need help\??$', r'^customer reviews?$',
+        r'^show more$', r'^see all$', r'^view all$',
+        r'^page \d+', r'^\d+\s*-\s*\d+\s*of\s*\d+',  # Pagination
+        r'^home\s*›', r'^›', r'breadcrumb',  # Navigation breadcrumbs
+        r'^sign in$', r'^cart$', r'^checkout$',
+        r'^let us know$', r'^sponsored\s*sponsored$'
     ]
 
     for block in blocks:
         block = block.strip()
-        if len(block) < 30:
+        # Increased minimum length from 30 to 80 characters
+        if len(block) < 80:
             continue
 
         is_noise = any(re.search(pattern, block, re.IGNORECASE) for pattern in noise_patterns)
         if is_noise:
             continue
 
-        has_price = bool(re.search(r'[₹$]\s*[\d,]+', block))
-        has_product_words = bool(re.search(r'\b(?:buy|price|offer|discount|sale|deal|product|item|model|brand|available|stock|delivery|shipping)\b', block, re.IGNORECASE))
+        has_price = block_has_price(block)
+        has_product_words = bool(re.search(r'\b(?:buy|price|offer|discount|sale|deal|product|item|model|brand|available|stock|delivery|shipping|stars?|ratings?|reviews?)\b', block, re.IGNORECASE))
+        has_query_keyword = bool(query_keywords and any(kw in block.lower() for kw in query_keywords))
+        has_product_shape = looks_like_product_block(block, query_keywords)
 
-        if has_price or has_product_words:
+        if has_price and (len(block) >= 180 or has_product_words or has_query_keyword):
+            filtered_blocks.append(block)
+        elif has_product_shape:
             filtered_blocks.append(block)
     
     print(f"Total raw blocks: {len(blocks)}")
@@ -618,14 +690,14 @@ def extract_product_from_block(block: str, keywords: list = None) -> Dict:
         r'([A-Z][^\n₹\[\]]{15,120})\s*₹',              # Title directly before price
         
         # Link text (often contains product names)
-        r'\[([^\]]{15,120})\]\(https?://[^\)]+\)',      # [Product Title](https://...)
+        r'\[([^\]]{25,120})\]\(https?://[^\)]+\)',      # [Product Title](https://...) - increased from 15 to 25
         
         # Text near prices (common pattern)
-        r'([A-Z][^₹\n\[\]]{15,120})\s*[₹$]\s*[\d,]+',   # "Product Name ₹1,234"
-        r'[₹$]\s*[\d,]+\s*([A-Z][^₹\n\[\]]{15,120})',   # "₹1,234 Product Name"
+        r'([A-Z][^₹\n\[\]]{25,120})\s*[₹$]\s*[\d,]+',   # "Product Name ₹1,234" - increased from 15 to 25
+        r'[₹$]\s*[\d,]+\s*([A-Z][^₹\n\[\]]{25,120})',   # "₹1,234 Product Name" - increased from 15 to 25
         
         # Sentences that look like product descriptions
-        r'([A-Z][^.\n]{20,120}(?:with|featuring|equipped|includes)[^.\n]{5,50})', # Descriptive titles
+        r'([A-Z][^.\n]{25,120}(?:with|featuring|equipped|includes)[^.\n]{5,50})', # Descriptive titles
     ]
     
     title = None
@@ -641,12 +713,21 @@ def extract_product_from_block(block: str, keywords: list = None) -> Dict:
             candidate = re.sub(r'\s+', ' ', candidate)
             candidate = re.sub(r'\([^)]*\)', '', candidate)  # Remove parentheses
             
+            # Require minimum length of 25 chars (stricter than before)
+            if len(candidate) < 25:
+                continue
+            
+            # Require at least 3 words
+            words = [w for w in candidate.split() if len(w) > 1]
+            if len(words) < 3:
+                continue
+            
             # Score the candidate based on how "product-like" it is
             score = 0
             
             # Length bonus (not too short, not too long)
-            if 20 <= len(candidate) <= 100:
-                score += 2
+            if 25 <= len(candidate) <= 100:
+                score += 3  # Increased from 2
             
             # Keyword bonus (if keywords provided)
             if keywords:
@@ -665,16 +746,21 @@ def extract_product_from_block(block: str, keywords: list = None) -> Dict:
             indicator_bonus = sum(1 for indicator in product_indicators if indicator in candidate.lower())
             score += indicator_bonus
             
-            # Penalize navigation/generic text
+            # Penalize navigation/generic text (stricter penalties)
             bad_indicators = [
                 'select', 'department', 'category', 'filter', 'sort', 'results',
-                'your lists', 'account', 'cart', 'checkout', 'sign in'
+                'your lists', 'account', 'cart', 'checkout', 'sign in', 'skip',
+                'more', 'need help', 'customer review'
             ]
-            penalty = sum(2 for bad in bad_indicators if bad in candidate.lower())
+            penalty = sum(3 for bad in bad_indicators if bad in candidate.lower())  # Increased penalty from 2 to 3
             score -= penalty
             
-            # Choose the best title
-            if score > best_score and score > 0:
+            # Additional penalty for very generic/short phrases
+            if len(words) < 5:
+                score -= 1
+            
+            # Choose the best title (increased threshold from 0 to 2)
+            if score > best_score and score > 2:
                 best_score = score
                 title = candidate[:100]  # Limit length
     
@@ -825,6 +911,83 @@ def display_results(products: List[Dict]) -> None:
             print(f"   🔗 Link: {item['link']}")
         
         print("-" * 80)
+
+def filter_valid_products(products: List[Dict]) -> List[Dict]:
+    """Post-processing filter to remove obvious non-products and navigation elements"""
+    if not products:
+        return []
+    
+    valid_products = []
+    
+    # UI/Navigation patterns that should never appear as product titles
+    invalid_title_patterns = [
+        r'^skip\s+to',
+        r'^more\s+results?$',
+        r'^need\s+help\??$',
+        r'^\d+\s*of\s*\d+\s*results?',  # "16 of 75 results"
+        r'^-?\d+\s*of\s*\d+\s*results?',  # "-16 of 75 results"
+        r'^customer\s+reviews?$',
+        r'^show\s+more$',
+        r'^see\s+all$',
+        r'^view\s+all$',
+        r'^page\s+\d+',
+        r'^sign\s+in$',
+        r'^cart$',
+        r'^checkout$',
+        r'^home\s*›',
+        r'^›',
+        r'^\[.*›.*›.*\]',  # Breadcrumb links
+    ]
+    
+    for product in products:
+        title = product.get('title', '').strip()
+        price = product.get('price')
+        
+        # Validation checks
+        if not title or len(title) < 25:
+            continue
+        
+        # Title must have at least 3 words
+        word_count = len([w for w in title.split() if len(w) > 1])
+        if word_count < 3:
+            continue
+        
+        # Check against invalid patterns
+        is_invalid = any(re.search(pattern, title, re.IGNORECASE) for pattern in invalid_title_patterns)
+        if is_invalid:
+            continue
+        
+        # If price exists, ensure it is reasonable. Missing price is allowed.
+        if price is not None:
+            if not isinstance(price, (int, float)):
+                continue
+            if price < 50 or price > 10000000:  # ₹50 to ₹1 crore
+                continue
+        
+        # Title should contain at least one product-type word
+        product_type_words = [
+            'laptop', 'phone', 'tablet', 'watch', 'camera', 'speaker', 'headphone',
+            'machine', 'cleaner', 'washer', 'dryer', 'refrigerator', 'tv', 'monitor',
+            'mouse', 'keyboard', 'router', 'modem', 'charger', 'cable', 'adapter',
+            'bag', 'case', 'cover', 'stand', 'holder', 'mount', 'kit', 'set',
+            'apple', 'samsung', 'lg', 'dell', 'hp', 'lenovo', 'asus', 'sony',
+            'pro', 'plus', 'max', 'ultra', 'premium', 'edition', 'series', 'model',
+            'gb', 'tb', 'inch', 'core', 'gen', '5g', '4g', 'wireless', 'bluetooth'
+        ]
+        
+        title_lower = title.lower()
+        has_product_indicator = any(word in title_lower for word in product_type_words)
+        
+        if not has_product_indicator:
+            # If no product indicator, be more strict with length
+            if len(title) < 40:
+                continue
+        
+        valid_products.append(product)
+    
+    print(f"Filtered {len(products)} -> {len(valid_products)} valid products")
+    return valid_products
+
 def save_to_dataframe(products: List[Dict], filename: str = "scraped_products.csv") -> None:
     """Save products to a CSV file using pandas"""
     if not products:

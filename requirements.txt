@@ -1,7 +1,6 @@
 crawl4ai
-re
-asyncio
-subprocess
-urllib
 pandas
-speech_recognition
+SpeechRecognition
+requests
+aiohttp
+more-itertools
